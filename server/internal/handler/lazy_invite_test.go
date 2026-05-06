@@ -33,9 +33,9 @@ func makeLazyInviteFixture(t *testing.T, ctx context.Context, domain, slug strin
 	}
 }
 
-// makeUser creates a throwaway user row. The user FK ON DELETE CASCADE on
-// member rows handles cleanup of any memberships when the workspace is
-// deleted via the fixture's cleanup.
+// makeUser creates a throwaway user row. There's no DeleteUser sqlc query,
+// so cleanup goes through the test pool directly. ON DELETE CASCADE on
+// member rows handles any auto-created memberships.
 func makeUser(t *testing.T, ctx context.Context, email string) db.User {
 	t.Helper()
 	u, err := testHandler.Queries.CreateUser(ctx, db.CreateUserParams{
@@ -46,6 +46,9 @@ func makeUser(t *testing.T, ctx context.Context, email string) db.User {
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id = $1`, u.ID)
+	})
 	return u
 }
 
