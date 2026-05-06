@@ -2,10 +2,8 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -53,9 +51,8 @@ func (h *Handler) EnsureLazyInviteMembership(ctx context.Context, user db.User, 
 		Role:        "member",
 	})
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			// Unique violation — already a member. Idempotent no-op.
+		if isUniqueViolation(err) {
+			// Already a member. Idempotent no-op.
 			slog.Debug("lazy-invite: user already member",
 				"user_id", uuidToString(user.ID),
 				"workspace_slug", rule.WorkspaceSlug,
