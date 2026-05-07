@@ -1,0 +1,144 @@
+name: (DEV) Build & Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/dev-ecr.yml
+      - Dockerfile
+      - Dockerfile.web
+      - docker/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - turbo.json
+      - apps/**
+      - packages/**
+      - server/**
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional Docker tag override
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Resolve image tag
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SHA: ${{ github.sha }}
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          short_sha="${SHA::7}"
+          safe_ref="${REF_NAME//\//-}"
+
+          if [[ -n "${INPUT_IMAGE_TAG:-}" ]]; then
+            image_tag="$INPUT_IMAGE_TAG"
+          elif [[ "$EVENT_NAME" == "push" && "$REF_NAME" == "main" ]]; then
+            image_tag="main-${RUN_NUMBER}-${RUN_ATTEMPT}-${short_sha}"
+          else
+            image_tag="${safe_ref}-${RUN_NUMBER}-${RUN_ATTEMPT}-${short_sha}"
+          fi
+
+          if [[ ! "$image_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid Docker tag: $image_tag"
+            exit 1
+          fi
+
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "Using image tag: $image_tag"
+
+  build-and-push:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            repository: multica-backend
+            dockerfile: Dockerfile
+          - name: web
+            repository: multica-web
+            dockerfile: Dockerfile.web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.name }} image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          IMAGE_NAME: ${{ matrix.name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          image_uri="${ECR_REGISTRY}/${IMAGE_REPOSITORY}"
+          cache_scope="${IMAGE_REPOSITORY}"
+
+          build_args=()
+          if [[ "$IMAGE_NAME" == "backend" ]]; then
+            build_args+=(--build-arg "VERSION=${IMAGE_TAG}")
+            build_args+=(--build-arg "COMMIT=${GIT_SHA}")
+          else
+            build_args+=(--build-arg "REMOTE_API_URL=http://backend:8080")
+            build_args+=(--build-arg "NEXT_PUBLIC_APP_VERSION=${IMAGE_TAG}")
+          fi
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --file "${DOCKERFILE}" \
+            --provenance false \
+            --cache-from "type=gha,scope=${cache_scope}" \
+            --cache-to "type=gha,mode=max,scope=${cache_scope}" \
+            --tag "${image_uri}:${IMAGE_TAG}" \
+            --push \
+            "${build_args[@]}" \
+            .
+
+      - name: Print pushed image reference
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+        run: |
+          echo "${ECR_REGISTRY}/${{ matrix.repository }}:${IMAGE_TAG}"
