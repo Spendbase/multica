@@ -19,16 +19,14 @@ mac:
   target:
     - dmg
     - zip
-  # Hardcoded name avoids the `@multica/desktop-*` subdirectory that
-  # `${name}` produces for scoped package names.
-  # Naming scheme: multica-desktop-<version>-<platform>-<arch>.<ext>
-  # so the filename alone surfaces kind, version, platform, and CPU arch.
   artifactName: multica-desktop-${version}-mac-${arch}.${ext}
-  # Notarize via notarytool. Requires APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD
-  # + APPLE_TEAM_ID env vars at package time. Non-mac contributors are
-  # unaffected because `pnpm package` already requires the Developer ID
-  # signing cert — notarization is a strict superset.
-  notarize: true
+  # Spendbase fork ships unsigned builds — `identity: null` skips Developer
+  # ID code signing and `notarize: false` skips notarytool. Without these,
+  # electron-builder would auto-discover any keychain identity and fail the
+  # build when none is present. Users will need to right-click → Open the
+  # first launch on macOS to bypass Gatekeeper for ad-hoc signed apps.
+  identity: null
+  notarize: false
 dmg:
   artifactName: multica-desktop-${version}-mac-${arch}.${ext}
 linux:
