@@ -10,8 +10,8 @@ import { api } from "../api";
 
 export const chatKeys = {
   all: (wsId: string) => ["chat", wsId] as const,
+  /** Full sessions list (active + archived); the dropdown splits locally. */
   sessions: (wsId: string) => [...chatKeys.all(wsId), "sessions"] as const,
-  allSessions: (wsId: string) => [...chatKeys.all(wsId), "sessions", "all"] as const,
   session: (wsId: string, id: string) => [...chatKeys.all(wsId), "session", id] as const,
   messages: (sessionId: string) => ["chat", "messages", sessionId] as const,
   pendingTask: (sessionId: string) => ["chat", "pending-task", sessionId] as const,
@@ -21,17 +21,15 @@ export const chatKeys = {
   taskMessages: (taskId: string) => ["task-messages", taskId] as const,
 };
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isTaskMessageTaskId(taskId: string | null | undefined): taskId is string {
+  return typeof taskId === "string" && UUID_PATTERN.test(taskId);
+}
+
 export function chatSessionsOptions(wsId: string) {
   return queryOptions({
     queryKey: chatKeys.sessions(wsId),
-    queryFn: () => api.listChatSessions(),
-    staleTime: Infinity,
-  });
-}
-
-export function allChatSessionsOptions(wsId: string) {
-  return queryOptions({
-    queryKey: chatKeys.allSessions(wsId),
     queryFn: () => api.listChatSessions({ status: "all" }),
     staleTime: Infinity,
   });
@@ -78,7 +76,7 @@ export function taskMessagesOptions(taskId: string) {
   return queryOptions({
     queryKey: chatKeys.taskMessages(taskId),
     queryFn: () => api.listTaskMessages(taskId),
-    enabled: !!taskId,
+    enabled: isTaskMessageTaskId(taskId),
     staleTime: Infinity,
   });
 }

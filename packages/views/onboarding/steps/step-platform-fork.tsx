@@ -24,7 +24,7 @@ import { StepHeader } from "../components/step-header";
 import { RuntimeAsidePanel } from "../components/runtime-aside-panel";
 import { CompactRuntimeRow } from "../components/compact-runtime-row";
 import { useRuntimePicker } from "../components/use-runtime-picker";
-import { CloudWaitlistExpand } from "../components/cloud-waitlist-expand";
+import { useT } from "../../i18n";
 
 /**
  * Step 3 on **web**. The user is in a browser and hasn't downloaded
@@ -40,16 +40,14 @@ import { CloudWaitlistExpand } from "../components/cloud-waitlist-expand";
  *      probe. When a runtime appears and the user selects it, the
  *      dialog's "Connect & continue" button fires `onNext(runtime)`
  *      and advances the flow.
- *   3. **Cloud waitlist** — alt card, "Join waitlist" pill → opens a
- *      dialog with an email + reason form. Submitting is pure interest
- *      capture; the dialog doesn't advance the flow. The user then
- *      closes the dialog and can hit Skip in the footer.
+ *   3. **Cloud computer** — alt card, "Coming soon" badge. Not yet
+ *      available; rendered as a static, non-actionable preview.
  *
  * Footer is simplified — no Continue button, since the CLI dialog
  * owns that advancement itself. Only Skip remains.
  */
 
-type DialogState = "cli" | "cloud" | null;
+type DialogState = "cli" | null;
 
 // Single canonical download destination — the /download page owns
 // OS + arch detection, the All-Platforms matrix, release-note links,
@@ -62,24 +60,19 @@ export function StepPlatformFork({
   onNext,
   onBack,
   cliInstructions,
-  onWaitlistSubmitted,
 }: {
   wsId: string;
   onNext: (runtime: AgentRuntime | null) => void | Promise<void>;
   onBack?: () => void;
   /** Platform-specific CLI install card, rendered inside the CLI dialog. */
   cliInstructions?: ReactNode;
-  /** Parent-level latch used to label the onboarding completion path
-   *  as `cloud_waitlist` when the user ends up skipping Step 3 after
-   *  submitting the waitlist form. */
-  onWaitlistSubmitted?: () => void;
 }) {
+  const { t } = useT("onboarding");
   const mainRef = useRef<HTMLElement>(null);
   const fadeStyle = useScrollFade(mainRef);
 
   const [dialog, setDialog] = useState<DialogState>(null);
   const [downloaded, setDownloaded] = useState(false);
-  const [waitlistSubmitted, setWaitlistSubmitted] = useState(false);
 
   // Platform signal retained purely for PostHog dimensions — the UI
   // no longer branches on it (Windows / Linux desktop installers now
@@ -99,8 +92,10 @@ export function StepPlatformFork({
     // `source: "step3"` future-proofs if the event is reused from
     // another surface later.
     captureEvent("onboarding_runtime_path_selected", {
+      workspace_id: wsId,
       path: "download_desktop",
-      source: "step3",
+      source: "onboarding",
+      surface: "step3",
       is_mac: isMac,
     });
     // Cross-surface Desktop intent event — also fires from landing
@@ -113,20 +108,13 @@ export function StepPlatformFork({
   const handleOpenCli = () => {
     setDialog("cli");
     captureEvent("onboarding_runtime_path_selected", {
+      workspace_id: wsId,
       path: "cli",
-      source: "step3",
+      source: "onboarding",
+      surface: "step3",
       is_mac: isMac,
     });
     setPersonProperties({ platform_preference: "web" });
-  };
-
-  const handleOpenCloud = () => {
-    setDialog("cloud");
-    captureEvent("onboarding_runtime_path_selected", {
-      path: "cloud_waitlist",
-      source: "step3",
-      is_mac: isMac,
-    });
   };
 
   const handleCliConnect = () => {
@@ -136,13 +124,10 @@ export function StepPlatformFork({
   };
 
   const footerHint = (() => {
-    if (waitlistSubmitted) {
-      return "You're on the waitlist — pick Skip to keep exploring.";
-    }
     if (downloaded) {
-      return "Finish setup on the download page, then come back to this tab.";
+      return t(($) => $.step_platform.hint_downloaded);
     }
-    return "Pick a path above — or skip and configure a runtime later.";
+    return t(($) => $.step_platform.hint_default);
   })();
 
   return (
@@ -159,7 +144,7 @@ export function StepPlatformFork({
               className="flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {t(($) => $.common.back)}
             </button>
           ) : (
             <span aria-hidden className="w-0" />
@@ -176,52 +161,50 @@ export function StepPlatformFork({
         >
           <div className="mx-auto w-full max-w-[620px] px-6 py-10 sm:px-10 md:px-14 lg:px-0 lg:py-14">
             <div className="mb-2 text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">
-              Step 3 · Runtime
+              {t(($) => $.step_platform.eyebrow)}
             </div>
             <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
-              Connect a runtime.
+              {t(($) => $.step_platform.headline)}
             </h1>
             <p className="mt-4 max-w-[560px] text-[15.5px] leading-[1.55] text-muted-foreground">
-              A runtime is what actually runs your agents&apos; work. Pick
-              how you&apos;d like to set one up.
+              {t(($) => $.step_platform.lede)}
             </p>
 
             <div className="mt-10 flex max-w-[560px] flex-col gap-3.5">
               <ForkPrimary onClick={pickDesktop} downloaded={downloaded} />
 
               <ForkAlt
-                title="Install the CLI"
-                subtitle="For servers, remote dev boxes, and headless setups. Terminal required."
-                actionLabel="Show steps"
+                title={t(($) => $.step_platform.cli_title)}
+                subtitle={t(($) => $.step_platform.cli_subtitle)}
+                actionLabel={t(($) => $.step_platform.cli_action)}
                 onAction={handleOpenCli}
               />
 
               <ForkAlt
-                title="Cloud runtime"
-                subtitle="We host the runtime. Not live yet — join the waitlist."
-                actionLabel={
-                  waitlistSubmitted ? "On the list" : "Join waitlist"
-                }
-                onAction={handleOpenCloud}
+                title={t(($) => $.step_platform.cloud_title)}
+                subtitle={t(($) => $.step_platform.cloud_subtitle)}
+                actionLabel={t(($) => $.step_platform.cloud_action)}
+                disabled
               />
+            </div>
+
+            {/* Inline action bar — hint on the left, Skip on the right.
+                Advancement for the CLI path is owned by the CLI
+                dialog's own "Connect & continue" button; Skip creates
+                the single self-serve onboarding issue. */}
+            <div className="mt-8 flex max-w-[560px] flex-wrap items-center justify-between gap-x-4 gap-y-2">
+              <span
+                aria-live="polite"
+                className="text-xs text-muted-foreground"
+              >
+                {footerHint}
+              </span>
+              <Button variant="secondary" onClick={() => onNext(null)}>
+                {t(($) => $.step_runtime.skip)}
+              </Button>
             </div>
           </div>
         </main>
-
-        {/* Footer — hint on the left, Skip on the right. Advancement
-            for the CLI path is owned by the CLI dialog's own
-            "Connect & continue" button; Skip is the self-serve exit. */}
-        <footer className="flex shrink-0 items-center justify-between gap-4 bg-background px-6 py-4 sm:px-10 md:px-14 lg:px-16">
-          <span
-            aria-live="polite"
-            className="text-xs text-muted-foreground"
-          >
-            {footerHint}
-          </span>
-          <Button variant="secondary" onClick={() => onNext(null)}>
-            Skip for now
-          </Button>
-        </footer>
       </div>
 
       {/* Right — always-visible aside */}
@@ -244,16 +227,6 @@ export function StepPlatformFork({
         selectedName={picker.selected?.name ?? null}
         cliInstructions={cliInstructions}
       />
-
-      <CloudWaitlistDialog
-        open={dialog === "cloud"}
-        onClose={() => setDialog(null)}
-        submitted={waitlistSubmitted}
-        onSubmitted={() => {
-          setWaitlistSubmitted(true);
-          onWaitlistSubmitted?.();
-        }}
-      />
     </div>
   );
 }
@@ -269,6 +242,7 @@ function ForkPrimary({
   onClick: () => void;
   downloaded: boolean;
 }) {
+  const { t } = useT("onboarding");
   return (
     <button
       type="button"
@@ -281,19 +255,21 @@ function ForkPrimary({
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-[17px] font-medium tracking-tight">
           <Download className="h-4 w-4" aria-hidden />
-          {downloaded ? "Continuing on the download page…" : "Download the desktop app"}
+          {downloaded
+            ? t(($) => $.step_platform.download_title_after)
+            : t(($) => $.step_platform.download_title)}
         </div>
         <div className="mt-1 text-[13px] text-background/60">
           {downloaded
-            ? "Opened in a new tab. Pick your installer there, then finish setup on desktop."
-            : "Bundled daemon, zero setup. Pick your platform on the next page."}
+            ? t(($) => $.step_platform.download_subtitle_after)
+            : t(($) => $.step_platform.download_subtitle)}
         </div>
       </div>
       <span
         aria-hidden
         className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-background/10 px-4 py-2 text-[13px] font-medium transition-colors group-hover:bg-background/20"
       >
-        Download
+        {t(($) => $.step_platform.download_button)}
         <ArrowRight className="h-3.5 w-3.5" />
       </span>
     </button>
@@ -301,38 +277,51 @@ function ForkPrimary({
 }
 
 /**
- * Alt card with an explicit right-side action pill. The whole card is
- * clickable (so you can hit the title/subtitle too), but the pill is the
- * visual anchor — it's what tells the user "this card is a button".
- * Pressing it opens a dialog that owns the real content + action.
+ * Alt card with a right-side action. When `disabled`, the action
+ * renders as a static badge (used for "Coming soon" paths that aren't
+ * yet wired up); otherwise it's an outline button that fires
+ * `onAction` and typically opens a dialog.
  */
 function ForkAlt({
   title,
   subtitle,
   actionLabel,
   onAction,
+  disabled = false,
 }: {
   title: string;
   subtitle: ReactNode;
   actionLabel: ReactNode;
-  onAction: () => void;
+  onAction?: () => void;
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 rounded-lg border bg-card px-5 py-4">
+    <div
+      className={cn(
+        "flex items-center justify-between gap-4 rounded-lg border bg-card px-5 py-4",
+        disabled && "opacity-70",
+      )}
+    >
       <div className="min-w-0">
         <div className="text-[14.5px] font-medium text-foreground">{title}</div>
         <div className="mt-1 text-[12.5px] leading-[1.5] text-muted-foreground">
           {subtitle}
         </div>
       </div>
-      <Button
-        variant="outline"
-        size="sm"
-        className="shrink-0"
-        onClick={onAction}
-      >
-        {actionLabel}
-      </Button>
+      {disabled ? (
+        <span className="shrink-0 rounded-full border bg-muted px-3 py-1 text-[12px] font-medium text-muted-foreground">
+          {actionLabel}
+        </span>
+      ) : (
+        <Button
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={onAction}
+        >
+          {actionLabel}
+        </Button>
+      )}
     </div>
   );
 }
@@ -371,34 +360,26 @@ function CliInstallDialog({
   selectedName: string | null;
   cliInstructions?: ReactNode;
 }) {
+  const { t } = useT("onboarding");
   return (
     <Dialog open={open} onOpenChange={(o) => (o ? null : onClose())}>
-      {/* max-h + flex column so an unbounded runtime list (N machines)
-          triggers internal scrolling instead of pushing the footer's
-          Connect button below the viewport. */}
       <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-[560px]">
         <DialogHeader>
-          <DialogTitle>Install the CLI</DialogTitle>
+          <DialogTitle>{t(($) => $.step_platform.cli_dialog_title)}</DialogTitle>
           <DialogDescription>
-            Same daemon as Desktop, installed via terminal. Use it when
-            Desktop doesn&apos;t fit — servers, remote dev boxes, or
-            headless setups.
+            {t(($) => $.step_platform.cli_dialog_description)}
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pt-2">
           {cliInstructions}
 
-          {/* Live probe. Shows a staged waiting message with elapsed-
-              time fallbacks while no runtime is detected; flips to
-              a success list once the daemon registers via WS. */}
           {hasRuntimes ? (
             <>
               <div className="flex items-center gap-2 pt-1 text-sm">
                 <div className="h-2 w-2 rounded-full bg-success" />
                 <span className="font-medium">
-                  {runtimes.length} runtime{runtimes.length > 1 ? "s" : ""}{" "}
-                  connected
+                  {t(($) => $.step_platform.runtimes_connected, { count: runtimes.length })}
                 </span>
               </div>
               {/* Cap the runtime list at ~4 rows visible, scroll the rest.
@@ -428,16 +409,16 @@ function CliInstallDialog({
           <span className="text-xs text-muted-foreground">
             {hasRuntimes
               ? canConnect && selectedName
-                ? `Selected: ${selectedName}`
-                : "Pick a runtime above."
+                ? t(($) => $.step_runtime.hint_selected, { name: selectedName })
+                : t(($) => $.step_platform.cli_dialog_pick_hint)
               : null}
           </span>
           <div className="flex items-center gap-2">
             <Button variant="ghost" onClick={onClose}>
-              Cancel
+              {t(($) => $.common.cancel)}
             </Button>
             <Button disabled={!canConnect} onClick={onConnect}>
-              Connect &amp; continue
+              {t(($) => $.step_platform.cli_dialog_connect)}
               <ArrowRight className="h-4 w-4" />
             </Button>
           </div>
@@ -479,6 +460,7 @@ function formatElapsed(seconds: number) {
  * after closing resets the staging.
  */
 function CliWaitingStatus({ dialogOpen }: { dialogOpen: boolean }) {
+  const { t } = useT("onboarding");
   const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
@@ -520,7 +502,7 @@ function CliWaitingStatus({ dialogOpen }: { dialogOpen: boolean }) {
           className="inline-block size-2 shrink-0 rounded-full bg-success animate-pulse"
         />
         <span className="font-medium text-foreground">
-          Live · Listening for your daemon
+          {t(($) => $.step_platform.live_listening)}
         </span>
         <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
           {formatElapsed(elapsed)}
@@ -533,84 +515,33 @@ function CliWaitingStatus({ dialogOpen }: { dialogOpen: boolean }) {
       >
         {stage === "normal" && (
           <>
-            Run the command above. As soon as{" "}
-            <span className="font-mono">multica setup</span> finishes
-            browser sign-in and the daemon starts, your runtime will
-            appear here automatically (usually 10–30 seconds).
+            {t(($) => $.step_platform.stage_normal_prefix)}
+            <span className="font-mono">{"multica setup"}</span>
+            {t(($) => $.step_platform.stage_normal_suffix)}
           </>
         )}
         {stage === "midway" && (
           <>
-            Still listening. Make sure you finished the browser tab that{" "}
-            <span className="font-mono">multica setup</span> opened — it
-            needs you to approve the sign-in before the daemon can start.
+            {t(($) => $.step_platform.stage_midway_prefix)}
+            <span className="font-mono">{"multica setup"}</span>
+            {t(($) => $.step_platform.stage_midway_suffix)}
           </>
         )}
         {stage === "slow" && (
           <>
-            Taking longer than usual. Check the terminal where you ran{" "}
-            <span className="font-mono">multica setup</span> for errors.
+            {t(($) => $.step_platform.stage_slow_prefix)}
+            <span className="font-mono">{"multica setup"}</span>
+            {t(($) => $.step_platform.stage_slow_suffix)}
           </>
         )}
         {stage === "stalled" && (
           <>
-            Nothing coming through yet. If you&apos;re not comfortable
-            with the terminal,{" "}
-            <span className="font-medium text-foreground">Desktop</span>{" "}
-            is the smoother path — it bundles the daemon. Close this
-            dialog and pick Desktop, or hit Skip to continue.
+            {t(($) => $.step_platform.stage_stalled_prefix)}
+            <span className="font-medium text-foreground">{t(($) => $.step_platform.stage_stalled_term)}</span>
+            {t(($) => $.step_platform.stage_stalled_suffix)}
           </>
         )}
       </p>
     </div>
-  );
-}
-
-// ------------------------------------------------------------
-// Cloud waitlist dialog
-// ------------------------------------------------------------
-
-/**
- * Modal dialog for the cloud waitlist path. Wraps the shared
- * `CloudWaitlistExpand` form. Submitting it records interest — the
- * dialog does NOT advance the onboarding flow. After submit, the user
- * closes the dialog and can hit Skip in the footer.
- */
-function CloudWaitlistDialog({
-  open,
-  onClose,
-  submitted,
-  onSubmitted,
-}: {
-  open: boolean;
-  onClose: () => void;
-  submitted: boolean;
-  onSubmitted: () => void;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={(o) => (o ? null : onClose())}>
-      <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-[520px]">
-        <DialogHeader>
-          <DialogTitle>Join the cloud runtime waitlist</DialogTitle>
-          <DialogDescription>
-            Cloud runtimes aren&apos;t live yet. Leave your email and
-            we&apos;ll email you when they are.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="min-h-0 flex-1 overflow-y-auto pt-2">
-          <CloudWaitlistExpand
-            submitted={submitted}
-            onSubmitted={onSubmitted}
-          />
-        </div>
-
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>
-            {submitted ? "Close" : "Cancel"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }

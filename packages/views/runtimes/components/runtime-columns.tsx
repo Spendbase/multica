@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import {
   ArrowUpCircle,
+  Globe,
   MoreHorizontal,
   Trash2,
 } from "lucide-react";
@@ -41,13 +42,15 @@ import {
 import { ActorAvatar } from "../../common/actor-avatar";
 import { workloadConfig } from "../../agents/presence";
 import { ProviderLogo } from "./provider-logo";
-import { HealthIcon, healthLabel } from "./shared";
+import { HealthIcon, useHealthLabel } from "./shared";
 import {
   computeCostInWindow,
   formatLastSeen,
   isVersionNewer,
   pctChange,
 } from "../utils";
+import { splitRuntimeName } from "./runtime-machines";
+import { useT } from "../../i18n";
 
 // Per-row data assembled at the page level. The columns reach into
 // `row.original` and never pull their own data — except for the per-runtime
@@ -60,29 +63,33 @@ export interface RuntimeRow {
   canDelete: boolean;
 }
 
-// Column widths in px. Runtime, Health, and CLI grow together until the
-// user resizes them. Their `size` values still flow into table.getTotalSize()
-// to set the table's min-width, giving each grow column a real floor below
-// which the container scrolls horizontally instead of shrinking further.
+// Column widths in px. Runtime is the primary scanning column, so it keeps
+// the only grow slot and receives the extra width until the user resizes it.
+// The size values still flow into table.getTotalSize() to set the table's
+// min-width, giving each column a real floor below which the container
+// scrolls horizontally instead of shrinking further.
 const COL_WIDTHS = {
-  runtime: 240,
-  health: 200,
-  owner: 60,
-  agents: 100,
-  workload: 140,
-  cost: 100,
-  cli: 140,
+  runtime: 340,
+  health: 150,
+  owner: 72,
+  agents: 92,
+  workload: 120,
+  cost: 96,
+  cli: 112,
   // 60 = 16 left padding + 28 kebab + 16 right padding. Keeps the
   // kebab's right edge 16px from the card so it lines up with the
   // toolbar's px-4 right inset.
   actions: 60,
 } as const;
 
+type RuntimesT = ReturnType<typeof useT<"runtimes">>["t"];
+
 interface CreateColumnsArgs {
   showOwner: boolean;
   latestCliVersion: string | null;
   wsId: string;
   now: number;
+  t: RuntimesT;
 }
 
 export function createRuntimeColumns({
@@ -90,20 +97,20 @@ export function createRuntimeColumns({
   latestCliVersion,
   wsId,
   now,
+  t,
 }: CreateColumnsArgs): ColumnDef<RuntimeRow>[] {
   const cols: ColumnDef<RuntimeRow>[] = [
     {
       id: "runtime",
-      header: "Runtime",
+      header: () => t(($) => $.list.col_runtime),
       size: COL_WIDTHS.runtime,
       meta: { grow: true },
       cell: ({ row }) => <RuntimeNameCell runtime={row.original.runtime} />,
     },
     {
       id: "health",
-      header: "Health",
+      header: () => t(($) => $.list.col_health),
       size: COL_WIDTHS.health,
-      meta: { grow: true },
       cell: ({ row }) => (
         <HealthCell runtime={row.original.runtime} now={now} />
       ),
@@ -113,7 +120,7 @@ export function createRuntimeColumns({
   if (showOwner) {
     cols.push({
       id: "owner",
-      header: "Owner",
+      header: () => t(($) => $.list.col_owner),
       size: COL_WIDTHS.owner,
       cell: ({ row }) =>
         row.original.ownerMember ? (
@@ -136,7 +143,7 @@ export function createRuntimeColumns({
   cols.push(
     {
       id: "agents",
-      header: "Agents",
+      header: () => t(($) => $.list.col_agents),
       size: COL_WIDTHS.agents,
       cell: ({ row }) => (
         <AgentStack agentIds={row.original.workload.agentIds} />
@@ -144,7 +151,7 @@ export function createRuntimeColumns({
     },
     {
       id: "workload",
-      header: "Workload",
+      header: () => t(($) => $.list.col_workload),
       size: COL_WIDTHS.workload,
       cell: ({ row }) => {
         const health = deriveRuntimeHealth(row.original.runtime, now);
@@ -160,15 +167,14 @@ export function createRuntimeColumns({
     },
     {
       id: "cost",
-      header: () => <div className="text-right">Cost · 7d</div>,
+      header: () => <div className="text-right">{t(($) => $.list.col_cost)}</div>,
       size: COL_WIDTHS.cost,
       cell: ({ row }) => <CostCell runtimeId={row.original.runtime.id} />,
     },
     {
       id: "cli",
-      header: "CLI",
+      header: () => t(($) => $.list.col_cli),
       size: COL_WIDTHS.cli,
-      meta: { grow: true },
       cell: ({ row }) => (
         <CliCell
           runtime={row.original.runtime}
@@ -203,48 +209,44 @@ export function createRuntimeColumns({
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Backend formats `runtime.name` as `"<base> (<hostname>)"`. Every runtime on
-// the same machine repeats the hostname suffix, so it dominates column width
-// while carrying near-zero scan value once seen on the first row. Split it
-// so the base name stays emphasised and the hostname renders muted.
-export function splitRuntimeName(name: string): {
-  base: string;
-  hostname: string | null;
-} {
-  const m = name.match(/^(.+?)\s+\(([^)]+)\)$/);
-  if (!m || !m[1] || !m[2]) return { base: name, hostname: null };
-  return { base: m[1], hostname: m[2] };
-}
-
 // ---------------------------------------------------------------------------
 // Cell renderers
 // ---------------------------------------------------------------------------
 
 function RuntimeNameCell({ runtime }: { runtime: AgentRuntime }) {
-  const { base: baseName, hostname } = splitRuntimeName(runtime.name);
+  const { base: baseName } = splitRuntimeName(runtime.name);
   return (
     <div className="flex min-w-0 items-center gap-2">
       <div className="flex h-8 w-8 shrink-0 items-center justify-center">
         <ProviderLogo provider={runtime.provider} className="h-5 w-5" />
       </div>
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
-        <span className="block min-w-0 truncate text-sm font-medium">
+        <span className="block min-w-0 shrink truncate text-sm font-medium">
           {baseName}
         </span>
-        {hostname && (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <span className="block min-w-0 truncate text-xs text-muted-foreground/70">
-                  ({hostname})
-                </span>
-              }
-            />
-            <TooltipContent>{hostname}</TooltipContent>
-          </Tooltip>
-        )}
+        <VisibilityBadge runtime={runtime} />
       </div>
     </div>
+  );
+}
+
+// Only public is worth a badge — private is the default and rendering a
+// `🔒 Private` chip on every row turns the whole column into noise.
+function VisibilityBadge({ runtime }: { runtime: AgentRuntime }) {
+  const { t } = useT("runtimes");
+  if (runtime.visibility !== "public") return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span className="shrink-0 inline-flex items-center gap-0.5 rounded bg-info/10 px-1 text-[10px] font-medium text-info">
+            <Globe className="h-2.5 w-2.5" />
+            {t(($) => $.detail.visibility_label.public)}
+          </span>
+        }
+      />
+      <TooltipContent>{t(($) => $.detail.visibility_hint.public)}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -255,13 +257,14 @@ function HealthCell({
   runtime: AgentRuntime;
   now: number;
 }) {
+  const labelOf = useHealthLabel();
   const health = deriveRuntimeHealth(runtime, now);
   const lastSeen = formatLastSeen(runtime.last_seen_at);
   return (
     <div className="flex min-w-0 items-center gap-1.5">
       <HealthIcon health={health} />
       <span className="block min-w-0 truncate text-sm">
-        {healthLabel(health)}
+        {labelOf(health)}
         {health !== "online" && runtime.last_seen_at && (
           <span className="text-muted-foreground"> · {lastSeen}</span>
         )}
@@ -284,6 +287,7 @@ function WorkloadCell({
   queued: number;
   offline: boolean;
 }) {
+  const { t: tAgents } = useT("agents");
   if (offline) {
     return <span className="text-xs text-muted-foreground/50">—</span>;
   }
@@ -292,8 +296,6 @@ function WorkloadCell({
     queuedCount: queued,
   });
   const wl = workloadConfig[workload];
-  // Working: running count, with +Nq overflow tail. Queued: bare queued
-  // count. Idle: no counts at all — the label is the whole signal.
   const counts =
     workload === "working"
       ? queued > 0
@@ -304,13 +306,12 @@ function WorkloadCell({
         : null;
   return (
     <span className="inline-flex items-center gap-1 text-xs">
-      {/* Icon only for working/queued — see WorkloadCell in agent-columns. */}
       {workload !== "idle" && (
         <wl.icon
           className={`h-3 w-3 shrink-0 ${wl.textClass} ${workload === "working" ? "animate-spin" : ""}`}
         />
       )}
-      <span className={`shrink-0 ${wl.textClass}`}>{wl.label}</span>
+      <span className={`shrink-0 ${wl.textClass}`}>{tAgents(($) => $.workload[workload])}</span>
       {counts && (
         <span className="truncate font-mono tabular-nums text-muted-foreground">
           {counts}
@@ -331,6 +332,7 @@ function WorkloadCell({
 const COST_CELL_DAYS = 14;
 
 function CostCell({ runtimeId }: { runtimeId: string }) {
+  const { t } = useT("runtimes");
   const { data: usage = [] } = useQuery(
     runtimeUsageOptions(runtimeId, COST_CELL_DAYS),
   );
@@ -361,7 +363,7 @@ function CostCell({ runtimeId }: { runtimeId: string }) {
     delta == null
       ? null
       : delta === 0
-        ? "flat"
+        ? t(($) => $.list.cost_delta_flat)
         : `${delta > 0 ? "↑" : "↓"}${Math.abs(delta)}%`;
   return (
     <div className="flex flex-col items-end leading-tight">
@@ -382,6 +384,7 @@ function CliCell({
   runtime: AgentRuntime;
   latestCliVersion: string | null;
 }) {
+  const { t } = useT("runtimes");
   if (runtime.runtime_mode === "cloud") {
     return <span className="text-xs text-muted-foreground/50">—</span>;
   }
@@ -406,11 +409,6 @@ function CliCell({
 
   return (
     <div className="flex min-w-0 items-center gap-1 text-xs">
-      {isManaged && (
-        <span className="shrink-0 rounded-sm bg-muted px-1 py-0.5 text-[10px] font-medium text-muted-foreground">
-          Desktop
-        </span>
-      )}
       <span
         className={`truncate font-mono ${
           hasUpdate ? "text-warning" : "text-muted-foreground"
@@ -424,12 +422,12 @@ function CliCell({
             render={
               <ArrowUpCircle
                 className="h-3 w-3 shrink-0 text-warning"
-                aria-label="Update available"
+                aria-label={t(($) => $.list.cli_update_available_aria)}
               />
             }
           />
           <TooltipContent>
-            Update available: {latestCliVersion}
+            {t(($) => $.list.cli_update_available_tooltip, { version: latestCliVersion })}
           </TooltipContent>
         </Tooltip>
       )}
@@ -479,6 +477,7 @@ function RowMenu({
   wsId: string;
   canDelete: boolean;
 }) {
+  const { t } = useT("runtimes");
   const deleteMutation = useDeleteRuntime(wsId);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
@@ -489,12 +488,12 @@ function RowMenu({
   const handleDelete = () => {
     deleteMutation.mutate(runtime.id, {
       onSuccess: () => {
-        toast.success("Runtime deleted");
+        toast.success(t(($) => $.detail.toast_deleted));
         setDeleteOpen(false);
       },
       onError: (e) => {
         toast.error(
-          e instanceof Error ? e.message : "Failed to delete runtime",
+          e instanceof Error ? e.message : t(($) => $.detail.toast_delete_failed),
         );
       },
     });
@@ -508,7 +507,7 @@ function RowMenu({
             <Button
               variant="ghost"
               size="icon-sm"
-              aria-label="Row actions"
+              aria-label={t(($) => $.list.row_actions_aria)}
               onClick={(e) => e.stopPropagation()}
               onKeyDown={(e) => e.stopPropagation()}
             />
@@ -524,10 +523,10 @@ function RowMenu({
           <DropdownMenuItem
             variant="destructive"
             onClick={() => setDeleteOpen(true)}
-            title="Only the runtime owner and workspace admins can delete this runtime"
+            title={t(($) => $.list.delete_permission_hint)}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            Delete
+            {t(($) => $.list.delete_action)}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -540,23 +539,22 @@ function RowMenu({
       >
         <AlertDialogContent onClick={(e) => e.stopPropagation()}>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Runtime</AlertDialogTitle>
+            <AlertDialogTitle>{t(($) => $.detail.delete_dialog.title)}</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete &ldquo;{runtime.name}&rdquo;?
-              This action cannot be undone.
+              {t(($) => $.detail.delete_dialog.description, { name: runtime.name })}
               <span className="mt-2 block text-xs text-muted-foreground/80">
-                Only the runtime owner and workspace admins can delete a runtime.
+                {t(($) => $.list.delete_admin_hint)}
               </span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t(($) => $.detail.delete_dialog.cancel)}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               onClick={handleDelete}
               disabled={deleteMutation.isPending}
             >
-              {deleteMutation.isPending ? "Deleting..." : "Delete"}
+              {deleteMutation.isPending ? t(($) => $.detail.delete_dialog.deleting) : t(($) => $.detail.delete_dialog.confirm)}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

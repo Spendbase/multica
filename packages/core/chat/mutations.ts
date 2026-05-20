@@ -24,14 +24,13 @@ export function useCreateChatSession() {
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
-      qc.invalidateQueries({ queryKey: chatKeys.allSessions(wsId) });
     },
   });
 }
 
 /**
  * Clears the session's unread state server-side. Optimistically flips
- * has_unread to false in the cached lists so the FAB badge drops
+ * has_unread to false in the cached list so the FAB badge drops
  * immediately. The server broadcasts chat:session_read so other devices
  * also sync.
  */
@@ -46,35 +45,69 @@ export function useMarkChatSessionRead() {
     },
     onMutate: async (sessionId) => {
       await qc.cancelQueries({ queryKey: chatKeys.sessions(wsId) });
-      await qc.cancelQueries({ queryKey: chatKeys.allSessions(wsId) });
 
       const prevSessions = qc.getQueryData<ChatSession[]>(chatKeys.sessions(wsId));
-      const prevAll = qc.getQueryData<ChatSession[]>(chatKeys.allSessions(wsId));
 
       const clear = (old?: ChatSession[]) =>
         old?.map((s) => (s.id === sessionId ? { ...s, has_unread: false } : s));
       qc.setQueryData<ChatSession[]>(chatKeys.sessions(wsId), clear);
-      qc.setQueryData<ChatSession[]>(chatKeys.allSessions(wsId), clear);
 
-      return { prevSessions, prevAll };
+      return { prevSessions };
     },
     onError: (err, sessionId, ctx) => {
       logger.error("markChatSessionRead.error.rollback", { sessionId, err });
       if (ctx?.prevSessions) qc.setQueryData(chatKeys.sessions(wsId), ctx.prevSessions);
-      if (ctx?.prevAll) qc.setQueryData(chatKeys.allSessions(wsId), ctx.prevAll);
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
-      qc.invalidateQueries({ queryKey: chatKeys.allSessions(wsId) });
     },
   });
 }
 
 /**
- * Hard-deletes a chat session. Optimistically removes the row from both
- * the active and all-sessions lists so the history panel updates instantly;
- * rolls back on error. The matching `chat:session_deleted` WS event keeps
- * other tabs/devices in sync — see use-realtime-sync.ts.
+ * Renames a chat session. Optimistically swaps the title in the cached
+ * list so the dropdown reflects the new label immediately; rolls back on
+ * error. The matching `chat:session_updated` WS event keeps other
+ * tabs/devices in sync — see use-realtime-sync.ts.
+ */
+export function useUpdateChatSession() {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+
+  return useMutation({
+    mutationFn: (data: { sessionId: string; title: string }) => {
+      logger.info("updateChatSession.start", {
+        sessionId: data.sessionId,
+        titleLength: data.title.length,
+      });
+      return api.updateChatSession(data.sessionId, { title: data.title });
+    },
+    onMutate: async ({ sessionId, title }) => {
+      await qc.cancelQueries({ queryKey: chatKeys.sessions(wsId) });
+
+      const prevSessions = qc.getQueryData<ChatSession[]>(chatKeys.sessions(wsId));
+
+      const patch = (old?: ChatSession[]) =>
+        old?.map((s) => (s.id === sessionId ? { ...s, title } : s));
+      qc.setQueryData<ChatSession[]>(chatKeys.sessions(wsId), patch);
+
+      return { prevSessions };
+    },
+    onError: (err, vars, ctx) => {
+      logger.error("updateChatSession.error.rollback", { sessionId: vars.sessionId, err });
+      if (ctx?.prevSessions) qc.setQueryData(chatKeys.sessions(wsId), ctx.prevSessions);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
+    },
+  });
+}
+
+/**
+ * Hard-deletes a chat session. Optimistically removes the row from the
+ * sessions list so the dropdown updates instantly; rolls back on error.
+ * The matching `chat:session_deleted` WS event keeps other tabs/devices
+ * in sync — see use-realtime-sync.ts.
  */
 export function useDeleteChatSession() {
   const qc = useQueryClient();
@@ -87,27 +120,22 @@ export function useDeleteChatSession() {
     },
     onMutate: async (sessionId) => {
       await qc.cancelQueries({ queryKey: chatKeys.sessions(wsId) });
-      await qc.cancelQueries({ queryKey: chatKeys.allSessions(wsId) });
 
       const prevSessions = qc.getQueryData<ChatSession[]>(chatKeys.sessions(wsId));
-      const prevAll = qc.getQueryData<ChatSession[]>(chatKeys.allSessions(wsId));
 
       const drop = (old?: ChatSession[]) => old?.filter((s) => s.id !== sessionId);
       qc.setQueryData<ChatSession[]>(chatKeys.sessions(wsId), drop);
-      qc.setQueryData<ChatSession[]>(chatKeys.allSessions(wsId), drop);
 
       logger.debug("deleteChatSession.optimistic", { sessionId });
-      return { prevSessions, prevAll };
+      return { prevSessions };
     },
     onError: (err, sessionId, ctx) => {
       logger.error("deleteChatSession.error.rollback", { sessionId, err });
       if (ctx?.prevSessions) qc.setQueryData(chatKeys.sessions(wsId), ctx.prevSessions);
-      if (ctx?.prevAll) qc.setQueryData(chatKeys.allSessions(wsId), ctx.prevAll);
     },
     onSettled: (_data, _err, sessionId) => {
       logger.debug("deleteChatSession.settled", { sessionId });
       qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
-      qc.invalidateQueries({ queryKey: chatKeys.allSessions(wsId) });
     },
   });
 }

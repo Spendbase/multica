@@ -1,26 +1,20 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, ArrowRight, Loader2, RefreshCw } from "lucide-react";
 import { captureEvent, setPersonProperties } from "@multica/core/analytics";
 import { Button } from "@multica/ui/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@multica/ui/components/ui/dialog";
 import { cn } from "@multica/ui/lib/utils";
 import { useScrollFade } from "@multica/ui/hooks/use-scroll-fade";
+import { runtimeKeys } from "@multica/core/runtimes/queries";
 import type { AgentRuntime } from "@multica/core/types";
 import { DragStrip } from "@multica/views/platform";
 import { StepHeader } from "../components/step-header";
 import { RuntimeAsidePanel } from "../components/runtime-aside-panel";
 import { useRuntimePicker } from "../components/use-runtime-picker";
-import { CloudWaitlistExpand } from "../components/cloud-waitlist-expand";
 import { ProviderLogo } from "../../runtimes/components/provider-logo";
+import { useT } from "../../i18n";
 
 /**
  * Step 3 (desktop) — connect a runtime.
@@ -42,28 +36,29 @@ export function StepRuntimeConnect({
   wsId,
   onNext,
   onBack,
-  onWaitlistSubmitted,
+  onRefresh,
 }: {
   wsId: string;
   onNext: (runtime: AgentRuntime | null) => void | Promise<void>;
   onBack?: () => void;
-  /** Parent-level latch used to label the onboarding completion path
-   *  as `cloud_waitlist` when the user ends up skipping this step
-   *  after submitting the waitlist form. */
-  onWaitlistSubmitted?: () => void;
+  /** Platform-level rescan hook. Desktop wires this to restart the
+   *  bundled daemon so a freshly-installed CLI shows up — otherwise the
+   *  daemon's PATH probe runs once at boot and never re-probes. */
+  onRefresh?: () => void | Promise<void>;
 }) {
   const { runtimes, selected, selectedId, setSelectedId } =
     useRuntimePicker(wsId);
 
   return (
     <FancyView
+      wsId={wsId}
       runtimes={runtimes}
       selected={selected}
       selectedId={selectedId}
       setSelectedId={setSelectedId}
       onNext={onNext}
       onBack={onBack}
-      onWaitlistSubmitted={onWaitlistSubmitted}
+      onRefresh={onRefresh}
     />
   );
 }
@@ -78,35 +73,44 @@ type Phase = "scanning" | "found" | "empty";
 const EMPTY_TIMEOUT_MS = 5000;
 
 function FancyView({
+  wsId,
   runtimes,
   selected,
   selectedId,
   setSelectedId,
   onNext,
   onBack,
-  onWaitlistSubmitted,
+  onRefresh,
 }: {
+  wsId: string;
   runtimes: AgentRuntime[];
   selected: AgentRuntime | null;
   selectedId: string | null;
   setSelectedId: (id: string) => void;
   onNext: (runtime: AgentRuntime | null) => void | Promise<void>;
   onBack?: () => void;
-  onWaitlistSubmitted?: () => void;
+  onRefresh?: () => void | Promise<void>;
 }) {
+  const { t } = useT("onboarding");
+  const qc = useQueryClient();
   const mainRef = useRef<HTMLElement>(null);
   const fadeStyle = useScrollFade(mainRef);
 
   // Flip to "empty" only after we've waited long enough for the daemon
   // to report. The 5s budget covers the bundled daemon's typical 1–3s
   // boot; anything past that is a genuine "no runtime" situation and we
-  // switch from scanning skeletons to the skip / cloud-waitlist exits.
+  // switch from scanning skeletons to the skip / refresh exits.
+  // `scanEpoch` resets the timer when the user hits Refresh, so a
+  // freshly-installed CLI gets another scanning window before falling
+  // back to the empty state.
+  const [scanEpoch, setScanEpoch] = useState(0);
   const [hasTimedOut, setHasTimedOut] = useState(false);
   useEffect(() => {
     if (runtimes.length > 0) return;
-    const t = window.setTimeout(() => setHasTimedOut(true), EMPTY_TIMEOUT_MS);
-    return () => window.clearTimeout(t);
-  }, [runtimes.length]);
+    setHasTimedOut(false);
+    const id = window.setTimeout(() => setHasTimedOut(true), EMPTY_TIMEOUT_MS);
+    return () => window.clearTimeout(id);
+  }, [runtimes.length, scanEpoch]);
 
   const phase: Phase =
     runtimes.length > 0 ? "found" : hasTimedOut ? "empty" : "scanning";
@@ -140,7 +144,9 @@ function FancyView({
     const detectMs = Math.round(now - (detectStartRef.current ?? now));
 
     captureEvent("onboarding_runtime_detected", {
-      source: "step3_desktop",
+      source: "onboarding",
+      surface: "step3_desktop",
+      workspace_id: wsId,
       outcome: phase,
       runtime_count: runtimes.length,
       online_count: onlineCount,
@@ -158,14 +164,31 @@ function FancyView({
   }, [phase, runtimes, onlineCount]);
 
   const [submitting, setSubmitting] = useState(false);
-  // Cloud waitlist submission state lives here (rather than in EmptyView)
-  // so it survives phase flips — e.g. a runtime coming online after the
-  // user has already submitted the waitlist form.
-  const [waitlistSubmitted, setWaitlistSubmitted] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Refresh triggers a re-scan: restart the daemon (if the platform
+  // wired `onRefresh`) so its PATH probe runs again, invalidate the
+  // runtime query, and reset the empty-state timeout so the user sees
+  // the scanning skeleton instead of the empty exits while the daemon
+  // boots back up.
+  const handleRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      if (onRefresh) await onRefresh();
+      await qc.invalidateQueries({ queryKey: runtimeKeys.all(wsId) });
+      detectedEmittedRef.current = false;
+      detectStartRef.current =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      setScanEpoch((n) => n + 1);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRefresh, qc, wsId, refreshing]);
 
   // Skip is always available — regardless of phase. Hitting Skip routes
-  // the flow through the self-serve branch (agent=null), which still
-  // completes onboarding and seeds a Getting Started project.
+  // through the runtime-less branch, which creates one focused self-serve
+  // onboarding issue instead of seeding the old starter project.
   const handleSkip = async () => {
     if (submitting) return;
     setSubmitting(true);
@@ -190,14 +213,12 @@ function FancyView({
 
   const footerHint =
     phase === "found" && selected
-      ? `Selected: ${selected.name}`
+      ? t(($) => $.step_runtime.hint_selected, { name: selected.name })
       : phase === "found"
-        ? "Pick a runtime above to continue."
+        ? t(($) => $.step_runtime.hint_pick)
         : phase === "scanning"
-          ? "Waiting for the first result…"
-          : waitlistSubmitted
-            ? "You're on the waitlist — skip to keep exploring."
-            : "Skip to enter your workspace, or join the cloud waitlist above.";
+          ? t(($) => $.step_runtime.hint_waiting)
+          : t(($) => $.step_runtime.hint_skip_or_refresh);
 
   return (
     <div className="animate-onboarding-enter grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_480px]">
@@ -214,7 +235,7 @@ function FancyView({
               className="flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {t(($) => $.common.back)}
             </button>
           ) : (
             <span aria-hidden className="w-0" />
@@ -226,7 +247,12 @@ function FancyView({
 
         {/* Scrollable middle — content changes by phase but always wraps
             at max-w-[620px] so the 2-column runtime grid has room to
-            breathe without stretching into readability territory. */}
+            breathe without stretching into readability territory.
+
+            Skip + Continue sit inline directly below the phase view
+            (not in a sticky bottom footer) so the action bar stays
+            close to the form content and the page doesn't leave a
+            large dead zone when the runtime list is short. */}
         <main
           ref={mainRef}
           style={fadeStyle}
@@ -247,49 +273,47 @@ function FancyView({
                 selectedId={selectedId}
                 onSelect={setSelectedId}
                 onlineCount={onlineCount}
+                onRefresh={handleRefresh}
+                refreshing={refreshing}
               />
             )}
             {phase === "empty" && (
               <EmptyView
-                waitlistSubmitted={waitlistSubmitted}
-                onWaitlistSubmitted={() => {
-                  setWaitlistSubmitted(true);
-                  onWaitlistSubmitted?.();
-                }}
                 onSkip={() => onNext(null)}
+                onRefresh={handleRefresh}
+                refreshing={refreshing}
               />
             )}
+
+            <div className="mt-8 flex flex-wrap items-center justify-end gap-x-4 gap-y-2">
+              <span
+                aria-live="polite"
+                className="mr-auto text-xs text-muted-foreground"
+              >
+                {footerHint}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="lg"
+                  variant="secondary"
+                  disabled={submitting}
+                  onClick={handleSkip}
+                >
+                  {t(($) => $.step_runtime.skip)}
+                </Button>
+                <Button
+                  size="lg"
+                  disabled={!canContinue || submitting}
+                  onClick={handleContinue}
+                >
+                  {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {t(($) => $.common.continue)}
+                  <ArrowRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
           </div>
         </main>
-
-        {/* Sticky footer — Skip (always) on the left, hint + Continue
-            (gated on runtime selection) on the right. Skip is the
-            self-serve exit: onNext(null) → bootstrap runs the no-agent
-            branch, onboarding still completes. */}
-        <footer className="flex shrink-0 items-center justify-end gap-4 bg-background px-6 py-4 sm:px-10 md:px-14 lg:px-16">
-          <span
-            aria-live="polite"
-            className="mr-auto text-xs text-muted-foreground"
-          >
-            {footerHint}
-          </span>
-          <Button
-            variant="secondary"
-            disabled={submitting}
-            onClick={handleSkip}
-          >
-            Skip for now
-          </Button>
-          <Button
-            size="lg"
-            disabled={!canContinue || submitting}
-            onClick={handleContinue}
-          >
-            {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-            Continue
-            <ArrowRight className="h-4 w-4" />
-          </Button>
-        </footer>
       </div>
 
       {/* Right — always-visible educational aside. "You picked" subsection
@@ -309,18 +333,20 @@ function FancyView({
 // ------------------------------------------------------------
 
 function ScanningView() {
+  const { t } = useT("onboarding");
   return (
     <div>
       <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
-        Looking for your tools…
+        {t(($) => $.step_runtime.scanning_headline)}
       </h1>
       <p className="mt-4 max-w-[560px] text-[15.5px] leading-[1.55] text-muted-foreground">
-        Multica drives local AI coding tools like{" "}
-        <span className="font-medium text-foreground">Claude Code</span>,{" "}
-        <span className="font-medium text-foreground">Codex</span>,{" "}
-        <span className="font-medium text-foreground">Cursor</span>, and
-        others. We&apos;re waiting to hear back from your machine about
-        which ones are installed.
+        {t(($) => $.step_runtime.scanning_lede_prefix)}
+        <span className="font-medium text-foreground">{"Claude Code"}</span>
+        {", "}
+        <span className="font-medium text-foreground">{"Codex"}</span>
+        {", "}
+        <span className="font-medium text-foreground">{"Cursor"}</span>
+        {t(($) => $.step_runtime.scanning_lede_suffix)}
       </p>
       <div className="mt-10 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
         <SkeletonRuntimeCard />
@@ -335,36 +361,39 @@ function FoundView({
   selectedId,
   onSelect,
   onlineCount,
+  onRefresh,
+  refreshing,
 }: {
   runtimes: AgentRuntime[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onlineCount: number;
+  onRefresh: () => void;
+  refreshing: boolean;
 }) {
+  const { t } = useT("onboarding");
   const total = runtimes.length;
   const statusLabel =
     onlineCount === total
-      ? "all online"
+      ? t(($) => $.step_runtime.status_all_online)
       : onlineCount === 0
-        ? "none online"
-        : `${onlineCount} online`;
+        ? t(($) => $.step_runtime.status_none_online)
+        : t(($) => $.step_runtime.status_n_online, { count: onlineCount });
   const statusTone =
     onlineCount === 0 ? "text-muted-foreground" : "text-success";
 
   return (
     <div>
       <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
-        We found your runtimes.
+        {t(($) => $.step_runtime.found_headline)}
       </h1>
       <p className="mt-4 max-w-[560px] text-[15.5px] leading-[1.55] text-muted-foreground">
-        We scanned your machine for AI coding tools you&apos;ve already
-        set up. Pick one for your first agent.
+        {t(($) => $.step_runtime.found_lede)}
       </p>
 
-      {/* Summary strip — trust signal ("we really did scan") */}
       <div className="mt-8 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-muted/60 px-4 py-2.5 text-xs">
         <span className="font-semibold text-foreground">
-          {total} runtime{total === 1 ? "" : "s"}
+          {t(($) => $.step_runtime.runtime_count, { count: total })}
         </span>
         <span className="text-muted-foreground">·</span>
         <span className={cn("flex items-center gap-1", statusTone)}>
@@ -377,6 +406,11 @@ function FoundView({
           />
           {statusLabel}
         </span>
+        <RefreshButton
+          onClick={onRefresh}
+          refreshing={refreshing}
+          className="ml-auto"
+        />
       </div>
 
       <div className="mt-6 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
@@ -394,80 +428,119 @@ function FoundView({
 }
 
 function EmptyView({
-  waitlistSubmitted,
-  onWaitlistSubmitted,
   onSkip,
+  onRefresh,
+  refreshing,
 }: {
-  waitlistSubmitted: boolean;
-  onWaitlistSubmitted: () => void;
   onSkip: () => void;
+  onRefresh: () => void;
+  refreshing: boolean;
 }) {
-  // Two exits: "Skip for now" (enter the workspace in read-only mode)
-  // or "Join waitlist" (capture interest in the hosted runtime we
-  // haven't shipped yet). We deliberately don't link out to Claude
-  // Code / Codex / Cursor here — those are other companies' products,
-  // and nudging the user to install one would frame Multica as a
-  // launcher for them rather than a product that runs them.
-  const [waitlistOpen, setWaitlistOpen] = useState(false);
+  const { t } = useT("onboarding");
 
   return (
     <div>
-      <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
-        No supported tools detected.
-      </h1>
+      <div className="flex items-start justify-between gap-4">
+        <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
+          {t(($) => $.step_runtime.empty_headline)}
+        </h1>
+        <RefreshButton
+          onClick={onRefresh}
+          refreshing={refreshing}
+          className="mt-2 shrink-0"
+        />
+      </div>
       <p className="mt-4 max-w-[560px] text-[15.5px] leading-[1.55] text-muted-foreground">
-        Multica drives local AI coding tools like{" "}
-        <span className="font-medium text-foreground">Claude Code</span>,{" "}
-        <span className="font-medium text-foreground">Codex</span>,{" "}
-        <span className="font-medium text-foreground">Cursor</span>, and
-        others — we didn&apos;t find any on this machine. Install one and
-        come back, or pick a path below.
+        {t(($) => $.step_runtime.empty_lede_prefix)}
+        <span className="font-medium text-foreground">{"Claude Code"}</span>
+        {", "}
+        <span className="font-medium text-foreground">{"Codex"}</span>
+        {", "}
+        <span className="font-medium text-foreground">{"Cursor"}</span>
+        {t(($) => $.step_runtime.empty_lede_suffix)}
       </p>
 
       <div className="mt-10 flex flex-col gap-3.5">
         <EmptyCard
-          title="Skip for now"
-          subtitle="Enter your workspace in read-only mode. Agents can't execute tasks until a runtime connects — but you can still browse, plan, and invite teammates."
-          actionLabel="Skip"
+          title={t(($) => $.step_runtime.empty_skip_title)}
+          subtitle={t(($) => $.step_runtime.empty_skip_subtitle)}
+          actionLabel={t(($) => $.step_runtime.empty_skip_action)}
           onAction={onSkip}
         />
 
-        <EmptyCard
-          title="Join the cloud runtime waitlist"
-          subtitle="We'll host the runtime for you — no local install, no setup. Not live yet; click to leave your email and get notified."
-          actionLabel={waitlistSubmitted ? "On the waitlist" : "Join waitlist"}
-          onAction={() => setWaitlistOpen(true)}
+        <ComingSoonCard
+          title={t(($) => $.step_runtime.empty_waitlist_title)}
+          subtitle={t(($) => $.step_runtime.empty_waitlist_subtitle)}
+          badgeLabel={t(($) => $.step_runtime.empty_waitlist_action)}
         />
       </div>
-
-      <Dialog
-        open={waitlistOpen}
-        onOpenChange={(o) => (o ? null : setWaitlistOpen(false))}
-      >
-        <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-[520px]">
-          <DialogHeader>
-            <DialogTitle>Join the cloud runtime waitlist</DialogTitle>
-            <DialogDescription>
-              Cloud runtimes aren&apos;t live yet. Leave your email and
-              we&apos;ll email you when they are.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="min-h-0 flex-1 overflow-y-auto pt-2">
-            <CloudWaitlistExpand
-              submitted={waitlistSubmitted}
-              onSubmitted={onWaitlistSubmitted}
-            />
-          </div>
-
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setWaitlistOpen(false)}>
-              {waitlistSubmitted ? "Close" : "Cancel"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
+  );
+}
+
+/**
+ * Static, non-interactive variant of EmptyCard used for the cloud-computer
+ * row. The card is dimmed and the pill is rendered as a badge so the user
+ * understands the option exists but isn't actionable yet. Mirrors the
+ * "Coming soon" treatment on the web platform fork.
+ */
+function ComingSoonCard({
+  title,
+  subtitle,
+  badgeLabel,
+}: {
+  title: string;
+  subtitle: string;
+  badgeLabel: string;
+}) {
+  return (
+    <div
+      aria-disabled
+      className="flex items-center justify-between gap-4 rounded-lg border border-dashed bg-muted/20 px-5 py-4 opacity-70"
+    >
+      <div className="min-w-0">
+        <div className="text-[14.5px] font-medium text-foreground">{title}</div>
+        <p className="mt-1 text-[12.5px] leading-[1.55] text-muted-foreground">
+          {subtitle}
+        </p>
+      </div>
+      <span
+        aria-hidden
+        className="inline-flex shrink-0 items-center rounded-full border bg-background px-3 py-1.5 text-[12px] font-medium uppercase tracking-wide text-muted-foreground"
+      >
+        {badgeLabel}
+      </span>
+    </div>
+  );
+}
+
+function RefreshButton({
+  onClick,
+  refreshing,
+  className,
+}: {
+  onClick: () => void;
+  refreshing: boolean;
+  className?: string;
+}) {
+  const { t } = useT("onboarding");
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      disabled={refreshing}
+      onClick={onClick}
+      className={className}
+    >
+      <RefreshCw
+        className={cn("h-3.5 w-3.5", refreshing && "animate-spin")}
+        aria-hidden
+      />
+      {refreshing
+        ? t(($) => $.step_runtime.refreshing)
+        : t(($) => $.step_runtime.refresh)}
+    </Button>
   );
 }
 
@@ -523,6 +596,7 @@ function RuntimeCard({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useT("onboarding");
   const online = runtime.status === "online";
 
   return (
@@ -553,7 +627,7 @@ function RuntimeCard({
             )}
             aria-hidden
           />
-          {online ? "online" : "offline"}
+          {online ? t(($) => $.step_runtime.online_label) : t(($) => $.step_runtime.offline_label)}
         </div>
       </div>
       <RadioMark selected={selected} />
@@ -592,4 +666,3 @@ function RadioMark({ selected }: { selected: boolean }) {
     </span>
   );
 }
-

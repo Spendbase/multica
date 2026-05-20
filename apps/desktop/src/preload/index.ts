@@ -40,10 +40,33 @@ function fetchRuntimeConfig(): RuntimeConfigResult {
 const appInfo = fetchAppInfo();
 const runtimeConfig = fetchRuntimeConfig();
 
+// Read the OS-preferred locale that main injected via additionalArguments.
+// Zero IPC, zero blocking — process.argv is populated before preload runs.
+function fetchSystemLocale(): string {
+  const arg = process.argv.find((a) => a.startsWith("--multica-locale="));
+  return arg?.split("=")[1] ?? "en";
+}
+
+const systemLocale = fetchSystemLocale();
+
 const desktopAPI = {
   /** App version + normalized OS. Read once at preload time so the renderer
    *  can use it synchronously when initializing the API client. */
   appInfo,
+  /** OS-preferred locale (BCP 47), passed from main via additionalArguments.
+   *  Used by the renderer's LocaleAdapter as the system-preference signal. */
+  systemLocale,
+  /** Subscribe to OS language changes detected after boot. The renderer
+   *  decides whether to act (no-op when the user has an explicit Settings
+   *  choice). Returns an unsubscribe function. */
+  onSystemLocaleChanged: (callback: (locale: string) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, locale: string) =>
+      callback(locale);
+    ipcRenderer.on("locale:system-changed", handler);
+    return () => {
+      ipcRenderer.removeListener("locale:system-changed", handler);
+    };
+  },
   /** Validated runtime endpoint config, or a blocking config error. */
   runtimeConfig,
   /** Listen for auth token delivered via deep link */
@@ -66,6 +89,11 @@ const desktopAPI = {
   },
   /** Open a URL in the default browser */
   openExternal: (url: string) => ipcRenderer.invoke("shell:openExternal", url),
+  /** Download a file by URL through Electron's native download system.
+   *  Shows a save dialog and saves to disk. Unlike openExternal, this
+   *  avoids browser rendering of HTML files on Linux.
+   *  On non-desktop platforms this property is undefined. */
+  downloadURL: (url: string) => ipcRenderer.invoke("file:download-url", url),
   /** Toggle immersive mode — hide macOS traffic lights for full-screen modals */
   setImmersiveMode: (immersive: boolean) =>
     ipcRenderer.invoke("window:setImmersive", immersive),
@@ -179,8 +207,11 @@ const updaterAPI = {
     ipcRenderer.on("updater:download-progress", handler);
     return () => ipcRenderer.removeListener("updater:download-progress", handler);
   },
-  onUpdateDownloaded: (callback: () => void) => {
-    const handler = () => callback();
+  onUpdateDownloaded: (
+    callback: (info: { version: string; releaseNotes?: string }) => void,
+  ) => {
+    const handler = (_: unknown, info: { version: string; releaseNotes?: string }) =>
+      callback(info);
     ipcRenderer.on("updater:update-downloaded", handler);
     return () => ipcRenderer.removeListener("updater:update-downloaded", handler);
   },

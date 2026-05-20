@@ -8,11 +8,14 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  Copy,
   FilePlus2,
+  FolderKanban,
   Maximize2,
   Minimize2,
   Play,
   Rocket,
+  Webhook,
   X as XIcon,
   Zap,
 } from "lucide-react";
@@ -35,20 +38,26 @@ import { TimeInput } from "@multica/ui/components/ui/time-input";
 import { TimezonePicker } from "./pickers/timezone-picker";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { agentListOptions } from "@multica/core/workspace/queries";
+import { agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
+import { projectListOptions } from "@multica/core/projects/queries";
 import {
   useCreateAutopilot,
   useCreateAutopilotTrigger,
   useUpdateAutopilot,
   useUpdateAutopilotTrigger,
 } from "@multica/core/autopilots/mutations";
+import { buildAutopilotWebhookUrl } from "@multica/core/autopilots";
+import { api } from "@multica/core/api";
 import type {
+  AutopilotAssigneeType,
   AutopilotExecutionMode,
   AutopilotTrigger,
 } from "@multica/core/types";
 import { TitleEditor, ContentEditor } from "../../editor";
 import { ActorAvatar } from "../../common/actor-avatar";
-import { AgentPicker } from "./pickers/agent-picker";
+import { ProjectPicker } from "../../projects/components/project-picker";
+import { ProjectIcon } from "../../projects/components/project-icon";
+import { AgentPicker, type AssigneeSelection } from "./pickers/agent-picker";
 import {
   getDefaultTriggerConfig,
   getLocalTimezone,
@@ -57,6 +66,8 @@ import {
   type TriggerConfig,
   type TriggerFrequency,
 } from "./trigger-config";
+import { useT } from "../../i18n";
+import { formatSchedulePartialFailureToast } from "./autopilot-dialog-toast";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,6 +76,8 @@ import {
 export interface AutopilotInitial {
   title: string;
   description: string;
+  project_id: string | null;
+  assignee_type: AutopilotAssigneeType;
   assignee_id: string;
   execution_mode: AutopilotExecutionMode;
 }
@@ -87,26 +100,26 @@ export type AutopilotDialogProps =
     };
 
 // ---------------------------------------------------------------------------
-// Static data
+// Static schema-level data (not user-visible)
 // ---------------------------------------------------------------------------
 
-const FREQUENCY_OPTIONS: { value: TriggerFrequency; label: string }[] = [
-  { value: "hourly", label: "Every hour" },
-  { value: "daily", label: "Every day" },
-  { value: "weekdays", label: "Every weekday" },
-  { value: "weekly", label: "Every week" },
-  { value: "custom", label: "Custom cron" },
+const FREQUENCY_KEYS: TriggerFrequency[] = [
+  "hourly",
+  "daily",
+  "weekdays",
+  "weekly",
+  "custom",
 ];
 
-const DAY_OPTIONS: { value: number; label: string; short: string }[] = [
-  { value: 0, label: "Sunday", short: "Sun" },
-  { value: 1, label: "Monday", short: "Mon" },
-  { value: 2, label: "Tuesday", short: "Tue" },
-  { value: 3, label: "Wednesday", short: "Wed" },
-  { value: 4, label: "Thursday", short: "Thu" },
-  { value: 5, label: "Friday", short: "Fri" },
-  { value: 6, label: "Saturday", short: "Sat" },
-];
+const DAY_KEYS = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+] as const;
 
 const TIMEZONE_OPTIONS = [
   "UTC",
@@ -129,25 +142,12 @@ const TIMEZONE_OPTIONS = [
   "Pacific/Auckland",
 ];
 
-const OUTPUT_MODES: {
-  value: AutopilotExecutionMode;
-  label: string;
-  description: string;
-  Icon: typeof FilePlus2;
-}[] = [
-  {
-    value: "create_issue",
-    label: "Create issue",
-    description: "Each run creates a tracked issue",
-    Icon: FilePlus2,
-  },
-  {
-    value: "run_only",
-    label: "Run only",
-    description: "Silent run, no issue created",
-    Icon: Play,
-  },
-];
+const OUTPUT_MODE_KEYS: AutopilotExecutionMode[] = ["create_issue", "run_only"];
+
+const OUTPUT_MODE_ICONS: Record<AutopilotExecutionMode, typeof FilePlus2> = {
+  create_issue: FilePlus2,
+  run_only: Play,
+};
 
 // ---------------------------------------------------------------------------
 // Next-run computation (local approximation — server stores the authoritative value)
@@ -195,16 +195,19 @@ function computeNextRun(cfg: TriggerConfig, now: Date): Date | null {
   }
 }
 
-function formatCountdown(target: Date, now: Date): string {
-  const diff = Math.max(0, target.getTime() - now.getTime());
-  const seconds = Math.floor(diff / 1000);
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return "<1m";
+function useFormatCountdown(): (target: Date, now: Date) => string {
+  const { t } = useT("autopilots");
+  return (target, now) => {
+    const diff = Math.max(0, target.getTime() - now.getTime());
+    const seconds = Math.floor(diff / 1000);
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days > 0) return t(($) => $.trigger_config.countdown.days_hours, { days, hours });
+    if (hours > 0) return t(($) => $.trigger_config.countdown.hours_minutes, { hours, minutes });
+    if (minutes > 0) return t(($) => $.trigger_config.countdown.minutes, { minutes });
+    return t(($) => $.trigger_config.countdown.less_than_minute);
+  };
 }
 
 function formatNextRunAbsolute(date: Date, timezone: string): string {
@@ -241,10 +244,13 @@ function useNowTicker(intervalMs = 30_000): Date {
 // ---------------------------------------------------------------------------
 
 export function AutopilotDialog(props: AutopilotDialogProps) {
+  const { t } = useT("autopilots");
   const { open, onOpenChange } = props;
   const workspaceName = useCurrentWorkspace()?.name;
   const wsId = useWorkspaceId();
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+  const { data: squads = [] } = useQuery(squadListOptions(wsId));
+  const { data: projects = [] } = useQuery(projectListOptions(wsId));
   const [isExpanded, setIsExpanded] = useState(false);
 
   const isCreate = props.mode === "create";
@@ -254,6 +260,10 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
 
   const [title, setTitle] = useState(initial.title ?? "");
   const [description, setDescription] = useState(initial.description ?? "");
+  const [projectId, setProjectId] = useState<string | null>(initial.project_id ?? null);
+  const [assigneeType, setAssigneeType] = useState<AutopilotAssigneeType>(
+    initial.assignee_type ?? "agent",
+  );
   const [assigneeId, setAssigneeId] = useState<string>(initial.assignee_id ?? "");
   const [executionMode, setExecutionMode] = useState<AutopilotExecutionMode>(
     initial.execution_mode ?? "create_issue",
@@ -272,6 +282,20 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   })();
   const [triggerConfig, setTriggerConfig] = useState<TriggerConfig>(initialCfg);
 
+  // Trigger kind selector. Only meaningful in create mode — edit mode does
+  // not support converting between kinds inline (PLAN.md calls that
+  // out as "delete old, create new" rather than ambiguous in-place
+  // updates), so the toggle is hidden when editing. The kind is
+  // initialized from the first existing trigger so we render the right
+  // panel without surprising the user.
+  const initialKind: "schedule" | "webhook" = (() => {
+    if (isCreate) return "schedule";
+    const first = props.triggers[0];
+    if (first?.kind === "webhook") return "webhook";
+    return "schedule";
+  })();
+  const [triggerKind, setTriggerKind] = useState<"schedule" | "webhook">(initialKind);
+
   const initialCronRef = useRef(toCronExpression(initialCfg));
   const initialTimezoneRef = useRef(initialCfg.timezone);
   const scheduleDirty =
@@ -285,16 +309,36 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
   const triggerCount = isCreate ? 0 : props.triggers.length;
   const schedulePillDisabled = !isCreate && triggerCount >= 2;
 
-  const selectedAgent = useMemo(
-    () => agents.find((a) => a.id === assigneeId) ?? null,
-    [agents, assigneeId],
+  const selectedAssignee = useMemo(() => {
+    if (!assigneeId) return null;
+    if (assigneeType === "squad") {
+      const squad = squads.find((s) => s.id === assigneeId);
+      return squad ? { name: squad.name, description: squad.description } : null;
+    }
+    const agent = agents.find((a) => a.id === assigneeId);
+    return agent ? { name: agent.name, description: agent.description } : null;
+  }, [agents, squads, assigneeId, assigneeType]);
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === projectId) ?? null,
+    [projects, projectId],
   );
+
+  const handleAssigneeChange = (next: AssigneeSelection) => {
+    setAssigneeType(next.type);
+    setAssigneeId(next.id);
+  };
 
   const createAutopilot = useCreateAutopilot();
   const createTrigger = useCreateAutopilotTrigger();
   const updateAutopilot = useUpdateAutopilot();
   const updateTrigger = useUpdateAutopilotTrigger();
   const [submitting, setSubmitting] = useState(false);
+
+  // After a successful webhook-kind create, we don't close the dialog —
+  // we swap to a confirmation state showing the freshly minted URL with
+  // copy / done affordances. This avoids the "now go find your autopilot
+  // and click into it to grab the URL" friction.
+  const [createdWebhookTrigger, setCreatedWebhookTrigger] = useState<AutopilotTrigger | null>(null);
 
   const canSubmit =
     title.trim().length > 0 && assigneeId.length > 0 && !submitting;
@@ -307,33 +351,65 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
         const autopilot = await createAutopilot.mutateAsync({
           title: title.trim(),
           description: description.trim() || undefined,
+          project_id: executionMode === "create_issue" ? projectId : null,
+          assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
         });
-        let scheduleOk = true;
+        let triggerOk = true;
+        let triggerErrMessage: string | null = null;
+        let webhookTrigger: AutopilotTrigger | null = null;
         try {
-          await createTrigger.mutateAsync({
-            autopilotId: autopilot.id,
-            kind: "schedule",
-            cron_expression: toCronExpression(triggerConfig),
-            timezone: triggerConfig.timezone,
-          });
-        } catch {
-          scheduleOk = false;
+          if (triggerKind === "webhook") {
+            webhookTrigger = await createTrigger.mutateAsync({
+              autopilotId: autopilot.id,
+              kind: "webhook",
+            });
+          } else {
+            await createTrigger.mutateAsync({
+              autopilotId: autopilot.id,
+              kind: "schedule",
+              cron_expression: toCronExpression(triggerConfig),
+              timezone: triggerConfig.timezone,
+            });
+          }
+        } catch (err) {
+          triggerOk = false;
+          triggerErrMessage =
+            err instanceof Error && err.message ? err.message : null;
+        }
+        if (triggerKind === "webhook" && webhookTrigger) {
+          // Stay in the dialog and surface the URL inline so the user
+          // can copy it without first navigating to the detail page.
+          setCreatedWebhookTrigger(webhookTrigger);
+          toast.success(t(($) => $.dialog.toast_created));
+          return;
         }
         onOpenChange(false);
-        if (scheduleOk) toast.success("Autopilot created");
-        else toast.error("Autopilot created, but schedule failed to save");
+        if (triggerOk) {
+          toast.success(t(($) => $.dialog.toast_created));
+        } else {
+          // Partial success: autopilot saved, schedule failed. Show the
+          // server-provided reason so the user can act on it (cron syntax
+          // error, conflict, etc.) instead of seeing a generic message.
+          toast.error(formatSchedulePartialFailureToast(t, "create", triggerErrMessage));
+        }
       } else {
         await updateAutopilot.mutateAsync({
           id: props.autopilotId,
           title: title.trim(),
           description: description.trim() || null,
+          project_id: executionMode === "create_issue" ? projectId : null,
+          assignee_type: assigneeType,
           assignee_id: assigneeId,
           execution_mode: executionMode,
         });
         let scheduleOk = true;
-        if (scheduleDirty && !schedulePillDisabled) {
+        let scheduleErrMessage: string | null = null;
+        // Skip the schedule sync when the autopilot's first trigger is a
+        // webhook — there's no cron to update there, and the schedule
+        // panel isn't even rendered for webhook autopilots.
+        if (triggerKind === "schedule" && scheduleDirty && !schedulePillDisabled) {
           const snapshottedTriggerId = firstTriggerIdRef.current;
           try {
             if (snapshottedTriggerId) {
@@ -351,16 +427,27 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                 timezone: triggerConfig.timezone,
               });
             }
-          } catch {
+          } catch (err) {
             scheduleOk = false;
+            scheduleErrMessage =
+              err instanceof Error && err.message ? err.message : null;
           }
         }
         onOpenChange(false);
-        if (scheduleOk) toast.success("Autopilot updated");
-        else toast.error("Autopilot updated, but schedule failed to save");
+        if (scheduleOk) {
+          toast.success(t(($) => $.dialog.toast_updated));
+        } else {
+          toast.error(formatSchedulePartialFailureToast(t, "update", scheduleErrMessage));
+        }
       }
-    } catch {
-      toast.error(isCreate ? "Failed to create autopilot" : "Failed to update autopilot");
+    } catch (err) {
+      toast.error(
+        err instanceof Error && err.message
+          ? err.message
+          : isCreate
+            ? t(($) => $.dialog.toast_create_failed)
+            : t(($) => $.dialog.toast_update_failed),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -382,7 +469,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
         )}
       >
         <DialogTitle className="sr-only">
-          {isCreate ? "New Autopilot" : "Edit Autopilot"}
+          {isCreate ? t(($) => $.dialog.sr_create) : t(($) => $.dialog.sr_edit)}
         </DialogTitle>
 
         {/* Header */}
@@ -393,11 +480,13 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                 <Rocket className="size-3" />
               </span>
               <span className="font-medium text-foreground">
-                {isCreate ? "New autopilot" : "Edit autopilot"}
+                {isCreate
+                  ? t(($) => $.dialog.header_create)
+                  : t(($) => $.dialog.header_edit)}
               </span>
             </div>
             <span className="text-muted-foreground/60">·</span>
-            <span className="text-muted-foreground">A recurring AI task</span>
+            <span className="text-muted-foreground">{t(($) => $.dialog.subtitle)}</span>
             {workspaceName && (
               <>
                 <ChevronRight className="size-3 text-muted-foreground/40" />
@@ -417,7 +506,9 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                   </button>
                 }
               />
-              <TooltipContent side="bottom">{isExpanded ? "Collapse" : "Expand"}</TooltipContent>
+              <TooltipContent side="bottom">
+                {isExpanded ? t(($) => $.dialog.collapse) : t(($) => $.dialog.expand)}
+              </TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger
@@ -430,11 +521,21 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
                   </button>
                 }
               />
-              <TooltipContent side="bottom">Close</TooltipContent>
+              <TooltipContent side="bottom">{t(($) => $.dialog.close)}</TooltipContent>
             </Tooltip>
           </div>
         </div>
 
+        {createdWebhookTrigger ? (
+          <WebhookCreatedPanel
+            trigger={createdWebhookTrigger}
+            onClose={() => {
+              setCreatedWebhookTrigger(null);
+              onOpenChange(false);
+            }}
+          />
+        ) : (
+          <>
         {/* Body: two columns (stacks on narrow screens via flex-wrap at container level) */}
         <div
           key={contentKey}
@@ -446,7 +547,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
               <TitleEditor
                 autoFocus={isCreate}
                 defaultValue={initial.title ?? ""}
-                placeholder="Autopilot name"
+                placeholder={t(($) => $.dialog.title_placeholder)}
                 className="text-2xl font-semibold tracking-tight"
                 onChange={setTitle}
                 onSubmit={handleSubmit}
@@ -455,10 +556,10 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
 
             <div className="px-6 pb-2 shrink-0 flex items-baseline gap-2">
               <span className="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
-                Runbook
+                {t(($) => $.dialog.runbook_label)}
               </span>
               <span className="text-xs text-muted-foreground/80">
-                Read by the agent on every run
+                {t(($) => $.dialog.runbook_hint)}
               </span>
             </div>
 
@@ -466,7 +567,7 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
               <div className="h-full overflow-y-auto rounded-lg border border-border bg-background transition-colors focus-within:border-input px-4 py-3">
                 <ContentEditor
                   defaultValue={initial.description ?? ""}
-                  placeholder={`# Goal\nWhat should the agent accomplish?\n\n# Context\nWho is this for? Any constraints?\n\n# Steps\n1. …\n2. …`}
+                  placeholder={t(($) => $.dialog.description_placeholder)}
                   onUpdate={setDescription}
                   debounceMs={300}
                   showBubbleMenu={false}
@@ -478,24 +579,41 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
           {/* Right: Configuration */}
           <aside className="w-full lg:w-[340px] shrink-0 overflow-y-auto px-5 py-5 space-y-5 bg-muted/30">
             <AgentSection
+              selectedType={assigneeType}
               selectedId={assigneeId}
-              onChange={setAssigneeId}
-              selectedName={selectedAgent?.name}
-              selectedDescription={selectedAgent?.description}
+              onChange={handleAssigneeChange}
+              selectedName={selectedAssignee?.name}
+              selectedDescription={selectedAssignee?.description}
             />
 
             <OutputModeSection mode={executionMode} onChange={setExecutionMode} />
 
-            <ScheduleSection
-              config={triggerConfig}
-              onChange={setTriggerConfig}
-              disabled={schedulePillDisabled}
-              disabledReason={
-                schedulePillDisabled
-                  ? "This autopilot has multiple schedules — edit them in the detail page."
-                  : undefined
-              }
-            />
+            {executionMode === "create_issue" && (
+              <ProjectSection
+                projectId={projectId}
+                selectedProject={selectedProject}
+                onChange={setProjectId}
+              />
+            )}
+
+            {isCreate && (
+              <TriggerKindSection kind={triggerKind} onChange={setTriggerKind} />
+            )}
+
+            {triggerKind === "schedule" ? (
+              <ScheduleSection
+                config={triggerConfig}
+                onChange={setTriggerConfig}
+                disabled={schedulePillDisabled}
+                disabledReason={
+                  schedulePillDisabled
+                    ? t(($) => $.dialog.schedule_disabled_reason)
+                    : undefined
+                }
+              />
+            ) : (
+              <WebhookHelpSection isCreate={isCreate} />
+            )}
           </aside>
         </div>
 
@@ -503,25 +621,25 @@ export function AutopilotDialog(props: AutopilotDialogProps) {
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-t shrink-0 bg-background">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground min-w-0">
             <Zap className="size-3.5 text-amber-500 shrink-0" />
-            <span className="truncate">
-              Once saved, runs automatically until paused.
-            </span>
+            <span className="truncate">{t(($) => $.dialog.auto_run_hint)}</span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <Button size="sm" variant="outline" onClick={() => onOpenChange(false)}>
-              Cancel
+              {t(($) => $.dialog.cancel)}
             </Button>
             <Button size="sm" onClick={handleSubmit} disabled={!canSubmit}>
               {submitting
                 ? isCreate
-                  ? "Creating..."
-                  : "Saving..."
+                  ? t(($) => $.dialog.creating)
+                  : t(($) => $.dialog.saving)
                 : isCreate
-                ? "Create autopilot"
-                : "Save"}
+                ? t(($) => $.dialog.create)
+                : t(($) => $.dialog.save)}
             </Button>
           </div>
         </div>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -540,21 +658,25 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 function AgentSection({
+  selectedType,
   selectedId,
   onChange,
   selectedName,
   selectedDescription,
 }: {
+  selectedType: AutopilotAssigneeType;
   selectedId: string;
-  onChange: (id: string) => void;
+  onChange: (next: AssigneeSelection) => void;
   selectedName?: string;
   selectedDescription?: string;
 }) {
+  const { t } = useT("autopilots");
+  const hasSelection = selectedId.length > 0;
   return (
     <div>
-      <SectionLabel>Agent</SectionLabel>
+      <SectionLabel>{t(($) => $.dialog.section_assignee)}</SectionLabel>
       <AgentPicker
-        agentId={selectedId || null}
+        assignee={hasSelection ? { type: selectedType, id: selectedId } : null}
         onChange={onChange}
         align="start"
         triggerRender={
@@ -565,12 +687,12 @@ function AgentSection({
               "hover:bg-accent/40 transition-colors cursor-pointer",
             )}
           >
-            {selectedId ? (
+            {hasSelection ? (
               <ActorAvatar
-                actorType="agent"
+                actorType={selectedType}
                 actorId={selectedId}
                 size={28}
-                showStatusDot
+                showStatusDot={selectedType === "agent"}
               />
             ) : (
               <span className="inline-flex size-7 items-center justify-center rounded-full bg-muted text-muted-foreground">
@@ -579,7 +701,7 @@ function AgentSection({
             )}
             <span className="flex-1 min-w-0">
               <span className="block text-sm font-medium truncate">
-                {selectedName ?? "Select agent"}
+                {selectedName ?? t(($) => $.dialog.select_assignee)}
               </span>
               {selectedDescription && (
                 <span className="block text-xs text-muted-foreground truncate">
@@ -602,17 +724,19 @@ function OutputModeSection({
   mode: AutopilotExecutionMode;
   onChange: (mode: AutopilotExecutionMode) => void;
 }) {
+  const { t } = useT("autopilots");
   return (
     <div>
-      <SectionLabel>Output mode</SectionLabel>
+      <SectionLabel>{t(($) => $.dialog.section_output_mode)}</SectionLabel>
       <div className="space-y-1.5">
-        {OUTPUT_MODES.map((o) => {
-          const selected = o.value === mode;
+        {OUTPUT_MODE_KEYS.map((key) => {
+          const selected = key === mode;
+          const Icon = OUTPUT_MODE_ICONS[key];
           return (
             <button
-              key={o.value}
+              key={key}
               type="button"
-              onClick={() => onChange(o.value)}
+              onClick={() => onChange(key)}
               className={cn(
                 "w-full flex items-start gap-2.5 rounded-md border px-3 py-2 text-left cursor-pointer transition-colors",
                 selected
@@ -628,18 +752,67 @@ function OutputModeSection({
                     : "border-muted-foreground/40 bg-background",
                 )}
               >
-                {selected && <Check className="size-2.5" strokeWidth={3} />}
+                {selected ? (
+                  <Check className="size-2.5" strokeWidth={3} />
+                ) : (
+                  <Icon className="size-2.5 opacity-0" />
+                )}
               </span>
               <span className="flex-1 min-w-0">
-                <span className="block text-sm font-medium">{o.label}</span>
+                <span className="block text-sm font-medium">
+                  {t(($) => $.dialog.output_modes[key].label)}
+                </span>
                 <span className="block text-xs text-muted-foreground">
-                  {o.description}
+                  {t(($) => $.dialog.output_modes[key].description)}
                 </span>
               </span>
             </button>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function ProjectSection({
+  projectId,
+  selectedProject,
+  onChange,
+}: {
+  projectId: string | null;
+  selectedProject: { title: string; icon: string | null } | null;
+  onChange: (projectId: string | null) => void;
+}) {
+  const { t } = useT("autopilots");
+  return (
+    <div>
+      <SectionLabel>{t(($) => $.dialog.section_project)}</SectionLabel>
+      <ProjectPicker
+        projectId={projectId}
+        onUpdate={(updates) => onChange(updates.project_id ?? null)}
+        align="start"
+        triggerRender={
+          <button
+            type="button"
+            className={cn(
+              "w-full flex items-center gap-2.5 rounded-md border bg-background px-3 py-2 text-left",
+              "hover:bg-accent/40 transition-colors cursor-pointer",
+            )}
+          >
+            {selectedProject ? (
+              <ProjectIcon project={selectedProject} size="md" />
+            ) : (
+              <span className="inline-flex size-5 items-center justify-center rounded-md bg-muted text-muted-foreground">
+                <FolderKanban className="size-3.5" />
+              </span>
+            )}
+            <span className="flex-1 min-w-0 truncate text-sm font-medium">
+              {selectedProject?.title ?? t(($) => $.dialog.no_project)}
+            </span>
+            <ChevronDown className="size-3.5 text-muted-foreground shrink-0" />
+          </button>
+        }
+      />
     </div>
   );
 }
@@ -655,6 +828,8 @@ function ScheduleSection({
   disabled?: boolean;
   disabledReason?: string;
 }) {
+  const { t } = useT("autopilots");
+  const formatCountdown = useFormatCountdown();
   const now = useNowTicker();
   const next = useMemo(() => computeNextRun(config, now), [config, now]);
   const timezones = useMemo(() => {
@@ -667,7 +842,7 @@ function ScheduleSection({
 
   return (
     <div>
-      <SectionLabel>Schedule</SectionLabel>
+      <SectionLabel>{t(($) => $.dialog.section_schedule)}</SectionLabel>
       <div
         className={cn(
           "space-y-2",
@@ -686,9 +861,9 @@ function ScheduleSection({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {FREQUENCY_OPTIONS.map((f) => (
-                <SelectItem key={f.value} value={f.value}>
-                  {f.label}
+              {FREQUENCY_KEYS.map((freq) => (
+                <SelectItem key={freq} value={freq}>
+                  {t(($) => $.dialog.frequency_long[freq])}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -704,9 +879,9 @@ function ScheduleSection({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {DAY_OPTIONS.map((d) => (
-                  <SelectItem key={d.value} value={String(d.value)}>
-                    {d.label}
+                {DAY_KEYS.map((dayKey, i) => (
+                  <SelectItem key={dayKey} value={String(i)}>
+                    {t(($) => $.dialog.days[dayKey])}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -752,7 +927,7 @@ function ScheduleSection({
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground pt-1">
             <Clock className="size-3 shrink-0" />
             <span className="truncate">
-              Next run:{" "}
+              {t(($) => $.dialog.next_run_label)}{" "}
               <span className="text-foreground">
                 {formatNextRunAbsolute(next, config.timezone)}
               </span>
@@ -769,5 +944,171 @@ function ScheduleSection({
         </p>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Trigger kind segmented control + webhook help section
+// ---------------------------------------------------------------------------
+
+function TriggerKindSection({
+  kind,
+  onChange,
+}: {
+  kind: "schedule" | "webhook";
+  onChange: (kind: "schedule" | "webhook") => void;
+}) {
+  const { t } = useT("autopilots");
+  return (
+    <div>
+      <SectionLabel>{t(($) => $.dialog.section_trigger_kind)}</SectionLabel>
+      <div className="grid grid-cols-2 gap-1 rounded-md bg-muted p-1">
+        <TriggerKindButton
+          active={kind === "schedule"}
+          onClick={() => onChange("schedule")}
+          icon={<Clock className="h-3.5 w-3.5" />}
+          label={t(($) => $.dialog.trigger_kind_schedule)}
+        />
+        <TriggerKindButton
+          active={kind === "webhook"}
+          onClick={() => onChange("webhook")}
+          icon={<Webhook className="h-3.5 w-3.5" />}
+          label={t(($) => $.dialog.trigger_kind_webhook)}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TriggerKindButton({
+  active,
+  onClick,
+  icon,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex items-center justify-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors",
+        active
+          ? "bg-background text-foreground shadow-sm"
+          : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function WebhookHelpSection({ isCreate }: { isCreate: boolean }) {
+  const { t } = useT("autopilots");
+  return (
+    <div>
+      <SectionLabel>{t(($) => $.dialog.section_webhook)}</SectionLabel>
+      <p className="rounded-md border bg-background px-3 py-2 text-xs text-muted-foreground leading-relaxed">
+        {isCreate
+          ? t(($) => $.dialog.webhook_help_create)
+          : t(($) => $.dialog.webhook_help_edit)}
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Post-create state for webhook autopilots: shows the freshly minted URL
+// inline so the user can copy it without leaving the dialog.
+// ---------------------------------------------------------------------------
+
+function WebhookCreatedPanel({
+  trigger,
+  onClose,
+}: {
+  trigger: AutopilotTrigger;
+  onClose: () => void;
+}) {
+  const { t } = useT("autopilots");
+  const [copied, setCopied] = useState(false);
+
+  // Same URL composition the trigger row uses: prefer the server-provided
+  // webhook_url, fall back to apiBaseUrl + webhook_path, then origin + path.
+  const url =
+    buildAutopilotWebhookUrl({
+      trigger,
+      apiBaseUrl: api.getBaseUrl(),
+      currentOrigin: typeof window !== "undefined" ? window.location.origin : undefined,
+    }) ?? "";
+
+  const handleCopy = async () => {
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      toast.success(t(($) => $.trigger_row.url_copied));
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast.error(t(($) => $.trigger_row.url_copy_failed));
+    }
+  };
+
+  return (
+    <>
+      <div className="flex-1 min-h-0 overflow-y-auto px-8 py-10">
+        <div className="mx-auto max-w-xl space-y-5">
+          <div className="flex items-center gap-3">
+            <span className="inline-flex size-9 items-center justify-center rounded-full bg-primary/15 text-primary">
+              <Webhook className="size-4" />
+            </span>
+            <h2 className="text-lg font-semibold tracking-tight">
+              {t(($) => $.dialog.webhook_created_title)}
+            </h2>
+          </div>
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            {t(($) => $.dialog.webhook_created_description)}
+          </p>
+
+          <div>
+            <div className="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase mb-2">
+              {t(($) => $.trigger_row.webhook_url_label)}
+            </div>
+            <div className="flex items-stretch gap-1.5">
+              <code className="flex-1 min-w-0 truncate rounded-md border bg-muted px-3 py-2 text-xs font-mono text-foreground">
+                {url}
+              </code>
+              <Button
+                size="icon"
+                variant="outline"
+                className="h-9 w-9 shrink-0"
+                onClick={handleCopy}
+                title={t(($) => $.trigger_row.copy_url)}
+              >
+                {copied ? (
+                  <Check className="size-4 text-emerald-500" />
+                ) : (
+                  <Copy className="size-4 text-muted-foreground" />
+                )}
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400 leading-relaxed">
+            {t(($) => $.dialog.webhook_created_warning)}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-end gap-3 px-5 py-3 border-t shrink-0 bg-background">
+        <Button size="sm" onClick={onClose}>
+          {t(($) => $.dialog.webhook_created_done)}
+        </Button>
+      </div>
+    </>
   );
 }

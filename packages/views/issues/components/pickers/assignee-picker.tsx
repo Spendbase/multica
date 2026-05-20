@@ -8,7 +8,7 @@ import { useAuthStore } from "@multica/core/auth";
 import { canAssignAgentToIssue } from "@multica/core/permissions";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { useWorkspaceId } from "@multica/core/hooks";
-import { memberListOptions, agentListOptions, assigneeFrequencyOptions } from "@multica/core/workspace/queries";
+import { memberListOptions, agentListOptions, squadListOptions, assigneeFrequencyOptions } from "@multica/core/workspace/queries";
 import { ActorAvatar } from "../../../common/actor-avatar";
 import {
   PropertyPicker,
@@ -16,6 +16,8 @@ import {
   PickerSection,
   PickerEmpty,
 } from "./property-picker";
+import { useT } from "../../../i18n";
+import { matchesPinyin } from "../../../editor/extensions/pinyin-match";
 
 /**
  * Legacy boolean shape kept around for callers (e.g. `use-issue-actions.ts`)
@@ -54,6 +56,7 @@ export function AssigneePicker({
   onOpenChange?: (v: boolean) => void;
   align?: "start" | "center" | "end";
 }) {
+  const { t } = useT("issues");
   const [internalOpen, setInternalOpen] = useState(false);
   const open = controlledOpen ?? internalOpen;
   const setOpen = controlledOnOpenChange ?? setInternalOpen;
@@ -62,6 +65,7 @@ export function AssigneePicker({
   const wsId = useWorkspaceId();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+  const { data: squads = [] } = useQuery(squadListOptions(wsId));
   const { data: frequency = [] } = useQuery(assigneeFrequencyOptions(wsId));
   const { getActorName } = useActorName();
 
@@ -81,11 +85,14 @@ export function AssigneePicker({
 
   const query = filter.trim().toLowerCase();
   const filteredMembers = members
-    .filter((m) => m.name.toLowerCase().includes(query))
+    .filter((m) => m.name.toLowerCase().includes(query) || matchesPinyin(m.name, query))
     .sort((a, b) => getFreq("member", b.user_id) - getFreq("member", a.user_id));
   const filteredAgents = agents
-    .filter((a) => !a.archived_at && a.name.toLowerCase().includes(query))
+    .filter((a) => !a.archived_at && (a.name.toLowerCase().includes(query) || matchesPinyin(a.name, query)))
     .sort((a, b) => getFreq("agent", b.id) - getFreq("agent", a.id));
+  const filteredSquads = squads
+    .filter((s) => !s.archived_at && (s.name.toLowerCase().includes(query) || matchesPinyin(s.name, query)))
+    .sort((a, b) => getFreq("squad", b.id) - getFreq("squad", a.id));
 
   const isSelected = (type: string, id: string) =>
     assigneeType === type && assigneeId === id;
@@ -93,7 +100,7 @@ export function AssigneePicker({
   const triggerLabel =
     assigneeType && assigneeId
       ? getActorName(assigneeType, assigneeId)
-      : "Unassigned";
+      : t(($) => $.pickers.assignee.trigger_unassigned);
 
   return (
     <PropertyPicker
@@ -105,7 +112,7 @@ export function AssigneePicker({
       width="w-52"
       align={align}
       searchable
-      searchPlaceholder="Assign to..."
+      searchPlaceholder={t(($) => $.pickers.assignee.search_placeholder)}
       onSearchChange={setFilter}
       triggerRender={triggerRender}
       trigger={
@@ -115,7 +122,7 @@ export function AssigneePicker({
             <span className="truncate">{triggerLabel}</span>
           </>
         ) : (
-          <span className="text-muted-foreground">Unassigned</span>
+          <span className="text-muted-foreground">{t(($) => $.pickers.assignee.trigger_unassigned)}</span>
         )
       }
     >
@@ -129,13 +136,13 @@ export function AssigneePicker({
           }}
         >
           <UserMinus className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="text-muted-foreground">Unassigned</span>
+          <span className="text-muted-foreground">{t(($) => $.pickers.assignee.trigger_unassigned)}</span>
         </PickerItem>
       )}
 
       {/* Members */}
       {filteredMembers.length > 0 && (
-        <PickerSection label="Members">
+        <PickerSection label={t(($) => $.pickers.assignee.members_group)}>
           {filteredMembers.map((m) => (
             <PickerItem
               key={m.user_id}
@@ -157,7 +164,7 @@ export function AssigneePicker({
 
       {/* Agents */}
       {filteredAgents.length > 0 && (
-        <PickerSection label="Agents">
+        <PickerSection label={t(($) => $.pickers.assignee.agents_group)}>
           {filteredAgents.map((a) => {
             const decision = canAssignAgentToIssue(a, {
               userId: user?.id ?? null,
@@ -195,8 +202,32 @@ export function AssigneePicker({
         </PickerSection>
       )}
 
+      {/* Squads — group ownership; assigning to a squad routes the issue to
+          its leader agent on the backend. */}
+      {filteredSquads.length > 0 && (
+        <PickerSection label={t(($) => $.pickers.assignee.squads_group)}>
+          {filteredSquads.map((s) => (
+            <PickerItem
+              key={s.id}
+              selected={isSelected("squad", s.id)}
+              onClick={() => {
+                onUpdate({
+                  assignee_type: "squad",
+                  assignee_id: s.id,
+                });
+                setOpen(false);
+              }}
+            >
+              <ActorAvatar actorType="squad" actorId={s.id} size={18} />
+              <span>{s.name}</span>
+            </PickerItem>
+          ))}
+        </PickerSection>
+      )}
+
       {filteredMembers.length === 0 &&
         filteredAgents.length === 0 &&
+        filteredSquads.length === 0 &&
         filter && <PickerEmpty />}
     </PropertyPicker>
   );

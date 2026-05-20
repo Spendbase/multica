@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -38,17 +39,34 @@ var ErrEmailNotAllowed = SignupError{Message: "email address or domain not allow
 
 const devVerificationCodeEnv = "MULTICA_DEV_VERIFICATION_CODE"
 
+// supportedLanguages mirrors `SUPPORTED_LOCALES` in packages/core/i18n/types.ts.
+// Keep both lists in sync when adding a locale — the user-controlled `language`
+// field round-trips through GetMe back into i18n.changeLanguage(), so without
+// validation an arbitrary string would persist and echo to every device.
+var supportedLanguages = map[string]struct{}{
+	"en":      {},
+	"zh-Hans": {},
+}
+
 type UserResponse struct {
 	ID                      string          `json:"id"`
 	Name                    string          `json:"name"`
 	Email                   string          `json:"email"`
 	AvatarURL               *string         `json:"avatar_url"`
+	Language                *string         `json:"language"`
 	OnboardedAt             *string         `json:"onboarded_at"`
 	OnboardingQuestionnaire json.RawMessage `json:"onboarding_questionnaire"`
 	StarterContentState     *string         `json:"starter_content_state"`
+	ProfileDescription      string          `json:"profile_description"`
 	CreatedAt               string          `json:"created_at"`
 	UpdatedAt               string          `json:"updated_at"`
 }
+
+// MaxProfileDescriptionLen caps the user-supplied profile_description body.
+// Picked at 2000 chars per MUL-2406: enough room for role / stack / a few
+// preferences, short enough that injecting it into every agent brief
+// doesn't move the needle on prompt cost.
+const MaxProfileDescriptionLen = 2000
 
 func userToResponse(u db.User) UserResponse {
 	// JSONB column is []byte with DEFAULT '{}', so it's never nil at the DB
@@ -63,9 +81,11 @@ func userToResponse(u db.User) UserResponse {
 		Name:                    u.Name,
 		Email:                   u.Email,
 		AvatarURL:               textToPtr(u.AvatarUrl),
+		Language:                textToPtr(u.Language),
 		OnboardedAt:             timestampToPtr(u.OnboardedAt),
 		OnboardingQuestionnaire: json.RawMessage(q),
 		StarterContentState:     textToPtr(u.StarterContentState),
+		ProfileDescription:      u.ProfileDescription,
 		CreatedAt:               timestampToString(u.CreatedAt),
 		UpdatedAt:               timestampToString(u.UpdatedAt),
 	}
@@ -128,7 +148,7 @@ func (h *Handler) issueJWT(user db.User) (string, error) {
 		"sub":   uuidToString(user.ID),
 		"email": user.Email,
 		"name":  user.Name,
-		"exp":   time.Now().Add(30 * 24 * time.Hour).Unix(),
+		"exp":   time.Now().Add(auth.AuthTokenTTL()).Unix(),
 		"iat":   time.Now().Unix(),
 	})
 	return token.SignedString(auth.JWTSecret())
@@ -392,7 +412,7 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 
 	// Set CloudFront signed cookies for CDN access.
 	if h.CFSigner != nil {
-		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(30 * 24 * time.Hour)) {
+		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(auth.AuthTokenTTL())) {
 			http.SetCookie(w, cookie)
 		}
 	}
@@ -420,8 +440,10 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateMeRequest struct {
-	Name      *string `json:"name"`
-	AvatarURL *string `json:"avatar_url"`
+	Name               *string `json:"name"`
+	AvatarURL          *string `json:"avatar_url"`
+	Language           *string `json:"language"`
+	ProfileDescription *string `json:"profile_description"`
 }
 
 type GoogleLoginRequest struct {
@@ -712,6 +734,25 @@ func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AvatarURL != nil {
 		params.AvatarUrl = pgtype.Text{String: strings.TrimSpace(*req.AvatarURL), Valid: true}
+	}
+	if req.Language != nil {
+		lang := strings.TrimSpace(*req.Language)
+		if _, ok := supportedLanguages[lang]; !ok {
+			writeError(w, http.StatusBadRequest, "unsupported language")
+			return
+		}
+		params.Language = pgtype.Text{String: lang, Valid: true}
+	}
+	if req.ProfileDescription != nil {
+		// Count runes, not bytes: 2000 chars of Chinese must not be rejected
+		// as ~6000 bytes. utf8.RuneCountInString handles invalid UTF-8 by
+		// counting each bad byte as one rune, which still bounds the column.
+		desc := strings.TrimSpace(*req.ProfileDescription)
+		if utf8.RuneCountInString(desc) > MaxProfileDescriptionLen {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("profile_description exceeds %d characters", MaxProfileDescriptionLen))
+			return
+		}
+		params.ProfileDescription = pgtype.Text{String: desc, Valid: true}
 	}
 
 	updatedUser, err := h.Queries.UpdateUser(r.Context(), params)

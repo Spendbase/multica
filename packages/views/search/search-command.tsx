@@ -5,6 +5,7 @@ import {
   Check,
   Clock,
   Copy,
+  FileText,
   Link2,
   Loader2,
   MessageSquare,
@@ -20,26 +21,34 @@ import {
   Sun,
   BookOpenText,
   Settings,
-  Building2,
   type LucideIcon,
 } from "lucide-react";
 import { Command as CommandPrimitive } from "cmdk";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { SearchIssueResult, SearchProjectResult } from "@multica/core/types";
+import type {
+  MemberWithUser,
+  SearchIssueResult,
+  SearchProjectResult,
+} from "@multica/core/types";
 import { api } from "@multica/core/api";
-import { useRecentIssuesStore } from "@multica/core/issues/stores";
+import {
+  openCreateIssueWithPreference,
+  selectRecentIssues,
+  useRecentIssuesStore,
+} from "@multica/core/issues/stores";
 import { issueDetailOptions } from "@multica/core/issues/queries";
 import { useWorkspaceId } from "@multica/core";
-import { paths, useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
+import { useWorkspacePaths } from "@multica/core/paths";
 import type { WorkspacePaths } from "@multica/core/paths";
 import { useModalStore } from "@multica/core/modals";
-import { workspaceListOptions } from "@multica/core/workspace/queries";
+import { memberListOptions } from "@multica/core/workspace/queries";
 import { StatusIcon } from "../issues/components";
 import { ProjectIcon } from "../projects/components/project-icon";
 import { STATUS_CONFIG } from "@multica/core/issues/config";
 import { PROJECT_STATUS_CONFIG } from "@multica/core/projects/config";
 import type { ProjectStatus } from "@multica/core/types";
+import { ActorAvatar as ActorAvatarBase } from "@multica/ui/components/common/actor-avatar";
 import {
   Dialog,
   DialogContent,
@@ -49,13 +58,24 @@ import {
 } from "@multica/ui/components/ui/dialog";
 import { useTheme } from "@multica/ui/components/common/theme-provider";
 import { useNavigation } from "../navigation";
+import { useT } from "../i18n";
+import { matchesPinyin } from "../editor/extensions/pinyin-match";
 import { useSearchStore } from "./search-store";
 
 function HighlightText({ text, query }: { text: string; query: string }) {
   const parts = useMemo(() => {
     if (!query.trim()) return [{ text, highlight: false }];
-    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(`(${escaped})`, "gi");
+    // Build regex that matches the full phrase OR individual terms
+    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const escaped = query.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const patterns: string[] = [escaped];
+    if (terms.length > 1) {
+      for (const term of terms) {
+        const e = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        if (e && !patterns.includes(e)) patterns.push(e);
+      }
+    }
+    const regex = new RegExp(`(${patterns.join("|")})`, "gi");
     const result: { text: string; highlight: boolean }[] = [];
     let lastIndex = 0;
     let match: RegExpExecArray | null;
@@ -107,18 +127,25 @@ interface NavPage {
   keywords: string[];
 }
 
-const navPages: NavPage[] = [
-  { key: "inbox", label: "Inbox", icon: Inbox, keywords: ["inbox", "notifications"] },
-  { key: "myIssues", label: "My Issues", icon: CircleUser, keywords: ["my", "issues", "assigned"] },
-  { key: "issues", label: "Issues", icon: ListTodo, keywords: ["issues", "tasks", "bugs"] },
-  { key: "projects", label: "Projects", icon: FolderKanban, keywords: ["projects", "kanban"] },
-  { key: "agents", label: "Agents", icon: Bot, keywords: ["agents", "bots", "ai"] },
-  { key: "runtimes", label: "Runtimes", icon: Monitor, keywords: ["runtimes", "environments"] },
-  { key: "skills", label: "Skills", icon: BookOpenText, keywords: ["skills", "library"] },
-  { key: "settings", label: "Settings", icon: Settings, keywords: ["settings", "config", "preferences"] },
-];
-
 type ThemeValue = "light" | "dark" | "system";
+
+function memberInitials(name: string) {
+  return name
+    .split(" ")
+    .map((word) => word[0])
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
+}
+
+function matchesMember(member: MemberWithUser, query: string) {
+  return (
+    member.name.toLowerCase().includes(query) ||
+    member.email.toLowerCase().includes(query) ||
+    (query.length >= 3 && member.role.startsWith(query)) ||
+    matchesPinyin(member.name, query)
+  );
+}
 
 interface CommandItem {
   key: string;
@@ -135,15 +162,25 @@ interface SearchResults {
 }
 
 export function SearchCommand() {
+  const { t } = useT("search");
+  const navPages: NavPage[] = [
+    { key: "inbox", label: t(($) => $.pages.inbox), icon: Inbox, keywords: ["inbox", "notifications", "收件箱"] },
+    { key: "myIssues", label: t(($) => $.pages.my_issues), icon: CircleUser, keywords: ["my", "issues", "assigned", "我的"] },
+    { key: "issues", label: t(($) => $.pages.issues), icon: ListTodo, keywords: ["issues", "tasks", "bugs"] },
+    { key: "projects", label: t(($) => $.pages.projects), icon: FolderKanban, keywords: ["projects", "kanban", "项目"] },
+    { key: "agents", label: t(($) => $.pages.agents), icon: Bot, keywords: ["agents", "bots", "ai"] },
+    { key: "runtimes", label: t(($) => $.pages.runtimes), icon: Monitor, keywords: ["runtimes", "environments"] },
+    { key: "skills", label: t(($) => $.pages.skills), icon: BookOpenText, keywords: ["skills", "library"] },
+    { key: "settings", label: t(($) => $.pages.settings), icon: Settings, keywords: ["settings", "config", "preferences", "设置"] },
+  ];
   const { push, pathname, getShareableUrl } = useNavigation();
   const open = useSearchStore((s) => s.open);
   const setOpen = useSearchStore((s) => s.setOpen);
-  const recentItems = useRecentIssuesStore((s) => s.items);
   const wsId = useWorkspaceId();
+  const recentItems = useRecentIssuesStore(selectRecentIssues(wsId));
   const p: WorkspacePaths = useWorkspacePaths();
   const { theme, setTheme } = useTheme();
-  const currentWorkspace = useCurrentWorkspace();
-  const { data: workspaces = [] } = useQuery(workspaceListOptions());
+  const { data: members = [] } = useQuery(memberListOptions(wsId));
 
   // Resolve each recent issue via its cached detail entry. Recent items are
   // typically already in the detail cache because the user has opened them;
@@ -190,7 +227,7 @@ export function SearchCommand() {
     const activeThemeCheck = (value: ThemeValue) =>
       theme === value ? (
         <Check
-          aria-label="Current theme"
+          aria-label={t(($) => $.commands.current_theme_aria)}
           className="ml-auto size-4 shrink-0 text-muted-foreground"
         />
       ) : undefined;
@@ -198,17 +235,17 @@ export function SearchCommand() {
     const items: CommandItem[] = [
       {
         key: "new-issue",
-        label: "New Issue",
+        label: t(($) => $.commands.new_issue),
         icon: Plus,
         keywords: ["new", "issue", "create", "add"],
         onSelect: () => {
-          useModalStore.getState().open("quick-create-issue");
+          openCreateIssueWithPreference();
           setOpen(false);
         },
       },
       {
         key: "new-project",
-        label: "New Project",
+        label: t(($) => $.commands.new_project),
         icon: Plus,
         keywords: ["new", "project", "create", "add"],
         onSelect: () => {
@@ -223,24 +260,23 @@ export function SearchCommand() {
       items.push(
         {
           key: "copy-issue-link",
-          label: "Copy Issue Link",
+          label: t(($) => $.commands.copy_issue_link),
           icon: Link2,
           keywords: ["copy", "link", "share", "url", identifier.toLowerCase()],
           onSelect: () => {
-            const url = getShareableUrl ? getShareableUrl(pathname) : window.location.href;
-            void navigator.clipboard.writeText(url);
-            toast.success("Link copied");
+            void navigator.clipboard.writeText(getShareableUrl(pathname));
+            toast.success(t(($) => $.toast.link_copied));
             setOpen(false);
           },
         },
         {
           key: "copy-issue-identifier",
-          label: `Copy Identifier (${identifier})`,
+          label: t(($) => $.commands.copy_identifier, { identifier }),
           icon: Copy,
           keywords: ["copy", "id", "identifier", identifier.toLowerCase()],
           onSelect: () => {
             void navigator.clipboard.writeText(identifier);
-            toast.success(`Copied ${identifier}`);
+            toast.success(t(($) => $.toast.copied_identifier, { identifier }));
             setOpen(false);
           },
         },
@@ -250,7 +286,7 @@ export function SearchCommand() {
     items.push(
       {
         key: "theme-light",
-        label: "Switch to Light Theme",
+        label: t(($) => $.commands.switch_to_light),
         icon: Sun,
         keywords: ["light", "theme", "appearance", "mode", "bright"],
         trailing: activeThemeCheck("light"),
@@ -261,7 +297,7 @@ export function SearchCommand() {
       },
       {
         key: "theme-dark",
-        label: "Switch to Dark Theme",
+        label: t(($) => $.commands.switch_to_dark),
         icon: Moon,
         keywords: ["dark", "theme", "appearance", "mode", "night"],
         trailing: activeThemeCheck("dark"),
@@ -272,7 +308,7 @@ export function SearchCommand() {
       },
       {
         key: "theme-system",
-        label: "Use System Theme",
+        label: t(($) => $.commands.use_system_theme),
         icon: Monitor,
         keywords: ["system", "theme", "appearance", "mode", "auto"],
         trailing: activeThemeCheck("system"),
@@ -284,7 +320,7 @@ export function SearchCommand() {
     );
 
     return items;
-  }, [currentIssue, getShareableUrl, pathname, setOpen, setTheme, theme]);
+  }, [currentIssue, getShareableUrl, pathname, setOpen, setTheme, theme, t]);
 
   const filteredCommands = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -299,23 +335,24 @@ export function SearchCommand() {
     );
   }, [commands, query]);
 
-  // Only show workspaces different from the current one, and only after the
-  // user types >=2 chars — one char would match everything (e.g. "w").
-  const filteredWorkspaces = useMemo(() => {
+  const filteredMembers = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return [];
-    const others = workspaces.filter((w) => w.id !== currentWorkspace?.id);
-    const wantsAll =
-      q.length >= 2 && ("workspace".startsWith(q) || "switch".startsWith(q));
-    return others.filter(
-      (w) =>
-        wantsAll ||
-        w.name.toLowerCase().includes(q) ||
-        w.slug.toLowerCase().includes(q),
-    );
-  }, [workspaces, currentWorkspace?.id, query]);
+    const wantsAllMembers =
+      q.length >= 3 &&
+      ("members".startsWith(q) ||
+        "people".startsWith(q) ||
+        "users".startsWith(q) ||
+        "team".startsWith(q));
+    return members
+      .filter((member) => wantsAllMembers || matchesMember(member, q))
+      .slice(0, 10);
+  }, [members, query]);
 
-  const hasResults = results.issues.length > 0 || results.projects.length > 0;
+  const hasResults =
+    results.issues.length > 0 ||
+    results.projects.length > 0 ||
+    filteredMembers.length > 0;
 
   // Global Cmd+K / Ctrl+K shortcut
   useEffect(() => {
@@ -433,12 +470,12 @@ export function SearchCommand() {
     [push, setOpen, p],
   );
 
-  const handleSwitchWorkspace = useCallback(
-    (slug: string) => {
-      push(paths.workspace(slug).issues());
+  const handleMemberSelect = useCallback(
+    (userId: string) => {
+      push(p.memberDetail(userId));
       setOpen(false);
     },
-    [push, setOpen],
+    [push, setOpen, p],
   );
 
   return (
@@ -449,9 +486,9 @@ export function SearchCommand() {
         showCloseButton={false}
       >
         <DialogHeader className="sr-only">
-          <DialogTitle>Search</DialogTitle>
+          <DialogTitle>{t(($) => $.title)}</DialogTitle>
           <DialogDescription>
-            Search pages, issues, and projects
+            {t(($) => $.description)}
           </DialogDescription>
         </DialogHeader>
         <CommandPrimitive
@@ -462,7 +499,7 @@ export function SearchCommand() {
           <div className="flex items-center gap-3 border-b px-4 py-3">
             <SearchIcon className="size-5 shrink-0 text-muted-foreground" />
             <CommandPrimitive.Input
-              placeholder="Type a command or search..."
+              placeholder={t(($) => $.placeholder)}
               value={query}
               onValueChange={handleValueChange}
               className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
@@ -478,7 +515,7 @@ export function SearchCommand() {
             {filteredPages.length > 0 && (
               <CommandPrimitive.Group className="p-2">
                 <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
-                  Pages
+                  {t(($) => $.groups.pages)}
                 </div>
                 {filteredPages.map((page) => (
                   <CommandPrimitive.Item
@@ -500,7 +537,7 @@ export function SearchCommand() {
             {filteredCommands.length > 0 && (
               <CommandPrimitive.Group className="p-2">
                 <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
-                  Commands
+                  {t(($) => $.groups.commands)}
                 </div>
                 {filteredCommands.map((cmd) => (
                   <CommandPrimitive.Item
@@ -519,26 +556,32 @@ export function SearchCommand() {
               </CommandPrimitive.Group>
             )}
 
-            {/* Workspaces section — switch to a different workspace, only shown when query matches */}
-            {filteredWorkspaces.length > 0 && (
+            {filteredMembers.length > 0 && (
               <CommandPrimitive.Group className="p-2">
                 <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
-                  Switch Workspace
+                  {t(($) => $.groups.members)}
                 </div>
-                {filteredWorkspaces.map((ws) => (
+                {filteredMembers.map((member) => (
                   <CommandPrimitive.Item
-                    key={ws.id}
-                    value={`workspace:${ws.id}`}
-                    onSelect={() => handleSwitchWorkspace(ws.slug)}
+                    key={member.user_id}
+                    value={`member:${member.user_id}`}
+                    onSelect={() => handleMemberSelect(member.user_id)}
                     className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
-                    <Building2 className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate">
-                      <HighlightText text={ws.name} query={query} />
-                    </span>
-                    <span className="ml-auto text-xs text-muted-foreground truncate">
-                      {ws.slug}
-                    </span>
+                    <ActorAvatarBase
+                      name={member.name}
+                      initials={memberInitials(member.name)}
+                      avatarUrl={member.avatar_url}
+                      size={22}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate">
+                        <HighlightText text={member.name} query={query} />
+                      </div>
+                      <div className="truncate text-xs text-muted-foreground">
+                        <HighlightText text={member.email} query={query} />
+                      </div>
+                    </div>
                   </CommandPrimitive.Item>
                 ))}
               </CommandPrimitive.Group>
@@ -554,16 +597,15 @@ export function SearchCommand() {
               query.trim() &&
               !hasResults &&
               filteredPages.length === 0 &&
-              filteredCommands.length === 0 &&
-              filteredWorkspaces.length === 0 && (
+              filteredCommands.length === 0 && (
                 <CommandPrimitive.Empty className="py-10 text-center text-sm text-muted-foreground">
-                  No results found.
+                  {t(($) => $.empty.no_results)}
                 </CommandPrimitive.Empty>
               )}
 
             {!isLoading && results.projects.length > 0 && (
               <CommandPrimitive.Group
-                heading="Projects"
+                heading={t(($) => $.groups.projects)}
                 className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
               >
                 {results.projects.map((project) => (
@@ -602,7 +644,7 @@ export function SearchCommand() {
 
             {!isLoading && results.issues.length > 0 && (
               <CommandPrimitive.Group
-                heading="Issues"
+                heading={t(($) => $.groups.issues)}
                 className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
               >
                 {results.issues.map((issue) => (
@@ -629,18 +671,28 @@ export function SearchCommand() {
                         {STATUS_CONFIG[issue.status].label}
                       </span>
                     </div>
-                    {issue.match_source === "comment" &&
-                      issue.matched_snippet && (
-                        <div className="flex items-start gap-2 pl-[26px]">
-                          <MessageSquare className="size-3 shrink-0 text-muted-foreground mt-0.5" />
-                          <span className="text-xs text-muted-foreground truncate">
-                            <HighlightText
-                              text={issue.matched_snippet}
-                              query={query}
-                            />
-                          </span>
-                        </div>
-                      )}
+                    {issue.matched_description_snippet && (
+                      <div className="flex items-start gap-2 pl-[26px]">
+                        <FileText className="size-3 shrink-0 text-muted-foreground mt-0.5" />
+                        <span className="text-xs text-muted-foreground truncate">
+                          <HighlightText
+                            text={issue.matched_description_snippet}
+                            query={query}
+                          />
+                        </span>
+                      </div>
+                    )}
+                    {issue.matched_comment_snippet && (
+                      <div className="flex items-start gap-2 pl-[26px]">
+                        <MessageSquare className="size-3 shrink-0 text-muted-foreground mt-0.5" />
+                        <span className="text-xs text-muted-foreground truncate">
+                          <HighlightText
+                            text={issue.matched_comment_snippet}
+                            query={query}
+                          />
+                        </span>
+                      </div>
+                    )}
                   </CommandPrimitive.Item>
                 ))}
               </CommandPrimitive.Group>
@@ -650,7 +702,7 @@ export function SearchCommand() {
               <CommandPrimitive.Group className="p-2">
                 <div className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-muted-foreground">
                   <Clock className="size-3" />
-                  <span>Recent</span>
+                  <span>{t(($) => $.groups.recent)}</span>
                 </div>
                 {recentIssues.map((item) => (
                   <CommandPrimitive.Item
@@ -679,7 +731,7 @@ export function SearchCommand() {
 
             {!isLoading && !query.trim() && recentIssues.length === 0 && (
               <div className="px-5 py-4 text-center text-xs text-muted-foreground">
-                Type to search issues and projects
+                {t(($) => $.empty.type_to_search)}
               </div>
             )}
           </CommandPrimitive.List>

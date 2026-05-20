@@ -1,27 +1,61 @@
 import { queryOptions } from "@tanstack/react-query";
 import { api } from "../api";
-import type { IssueStatus, ListIssuesParams, ListIssuesCache } from "../types";
+import type {
+  GroupedIssuesResponse,
+  IssueStatus,
+  ListGroupedIssuesParams,
+  ListIssuesParams,
+  ListIssuesCache,
+} from "../types";
 import { BOARD_STATUSES } from "./config";
 
 export const issueKeys = {
   all: (wsId: string) => ["issues", wsId] as const,
   list: (wsId: string) => [...issueKeys.all(wsId), "list"] as const,
+  assigneeGroupsAll: (wsId: string) =>
+    [...issueKeys.all(wsId), "assignee-groups"] as const,
+  assigneeGroups: (wsId: string, filter: AssigneeGroupedIssuesFilter) =>
+    [...issueKeys.assigneeGroupsAll(wsId), filter] as const,
   /** All "my issues" queries — use for bulk invalidation. */
   myAll: (wsId: string) => [...issueKeys.all(wsId), "my"] as const,
   /** Per-scope "my issues" list with filter identity baked into the key. */
   myList: (wsId: string, scope: string, filter: MyIssuesFilter) =>
     [...issueKeys.myAll(wsId), scope, filter] as const,
+  myAssigneeGroupsAll: (wsId: string) =>
+    [...issueKeys.myAll(wsId), "assignee-groups"] as const,
+  myAssigneeGroups: (
+    wsId: string,
+    scope: string,
+    filter: AssigneeGroupedIssuesFilter,
+  ) => [...issueKeys.myAssigneeGroupsAll(wsId), scope, filter] as const,
+  /** All Project Gantt queries — prefix-match key for cross-project invalidation. */
+  projectGanttAll: (wsId: string) =>
+    [...issueKeys.all(wsId), "project-gantt"] as const,
+  /**
+   * Per-project Gantt issue list (scheduled-only). Uses its own cache key
+   * rather than reusing the bucketed `myList` cache so WS handlers and
+   * cache helpers don't have to special-case a non-bucketed shape under
+   * the `my` prefix.
+   */
+  projectGantt: (wsId: string, projectId: string) =>
+    [...issueKeys.projectGanttAll(wsId), projectId] as const,
   detail: (wsId: string, id: string) =>
     [...issueKeys.all(wsId), "detail", id] as const,
   children: (wsId: string, id: string) =>
     [...issueKeys.all(wsId), "children", id] as const,
   childProgress: (wsId: string) =>
     [...issueKeys.all(wsId), "child-progress"] as const,
-  timeline: (issueId: string) => ["issues", "timeline", issueId] as const,
+  /** Full-issue timeline (single TanStack Query, no cursor). */
+  timeline: (issueId: string) =>
+    ["issues", "timeline", issueId] as const,
   reactions: (issueId: string) => ["issues", "reactions", issueId] as const,
   subscribers: (issueId: string) =>
     ["issues", "subscribers", issueId] as const,
   usage: (issueId: string) => ["issues", "usage", issueId] as const,
+  /** Issue-level attachments — used by the description editor so its
+   *  inline file-card / image NodeViews can re-sign download URLs at
+   *  click time. */
+  attachments: (issueId: string) => ["issues", "attachments", issueId] as const,
   /** Per-issue task list (issue-detail Execution log section). */
   tasks: (issueId: string) => ["issues", "tasks", issueId] as const,
   /** Prefix-match key for invalidating tasks across all issues — used by
@@ -32,7 +66,12 @@ export const issueKeys = {
 
 export type MyIssuesFilter = Pick<
   ListIssuesParams,
-  "assignee_id" | "assignee_ids" | "creator_id" | "project_id"
+  "assignee_id" | "assignee_ids" | "creator_id" | "project_id" | "involves_user_id"
+>;
+
+export type AssigneeGroupedIssuesFilter = Omit<
+  ListGroupedIssuesParams,
+  "group_by" | "limit" | "offset" | "group_assignee_type" | "group_assignee_id"
 >;
 
 /** Page size per status column. */
@@ -82,6 +121,22 @@ export function issueListOptions(wsId: string) {
   });
 }
 
+export function issueAssigneeGroupsOptions(
+  wsId: string,
+  filter: AssigneeGroupedIssuesFilter,
+) {
+  return queryOptions<GroupedIssuesResponse>({
+    queryKey: issueKeys.assigneeGroups(wsId, filter),
+    queryFn: () =>
+      api.listGroupedIssues({
+        group_by: "assignee",
+        limit: ISSUE_PAGE_SIZE,
+        offset: 0,
+        ...filter,
+      }),
+  });
+}
+
 /**
  * Server-filtered issue list for the My Issues page.
  * Each scope gets its own cache entry so switching tabs is instant after first load.
@@ -95,6 +150,76 @@ export function myIssueListOptions(
     queryKey: issueKeys.myList(wsId, scope, filter),
     queryFn: () => fetchFirstPages(filter),
     select: flattenIssueBuckets,
+  });
+}
+
+/**
+ * Page size for the scheduled-issue fetch. The Gantt view always pulls every
+ * scheduled issue (no client pagination), so this is just the chunk size we
+ * use to walk the server's `(limit, offset)` window until we hit `total`.
+ */
+export const PROJECT_GANTT_PAGE_LIMIT = 500;
+
+/**
+ * Paranoia cap on the loop in {@link fetchProjectGanttIssues}. Real projects
+ * shouldn't come close to this — a single project carrying 50k scheduled
+ * issues is already a product problem, not a Gantt-rendering one — but the
+ * guard prevents a buggy server `total` from spinning the loop forever.
+ */
+export const PROJECT_GANTT_MAX_ISSUES = 10_000;
+
+async function fetchProjectGanttIssues(projectId: string) {
+  const issues = [];
+  let offset = 0;
+  while (offset < PROJECT_GANTT_MAX_ISSUES) {
+    const res = await api.listIssues({
+      project_id: projectId,
+      scheduled: true,
+      limit: PROJECT_GANTT_PAGE_LIMIT,
+      offset,
+    });
+    issues.push(...res.issues);
+    if (res.issues.length < PROJECT_GANTT_PAGE_LIMIT) break;
+    if (issues.length >= res.total) break;
+    offset += PROJECT_GANTT_PAGE_LIMIT;
+  }
+  return issues;
+}
+
+/**
+ * One-shot fetch of every scheduled issue (`start_date` or `due_date` set)
+ * for a project. The Project Gantt view consumes this directly — no status
+ * bucketing, no client-side pagination, no Load-all affordance — because
+ * the scheduled subset is bounded enough to come back in a small handful of
+ * requests.
+ *
+ * Backed by `GET /api/issues?scheduled=true&project_id=…`; the SQL filter
+ * mirrors the same `(start_date IS NOT NULL OR due_date IS NOT NULL)`
+ * predicate the Gantt view applies on the client. Pages are walked until
+ * `total` is reached so an oversized project can't silently lose bars past
+ * the first page.
+ */
+export function projectGanttIssuesOptions(wsId: string, projectId: string) {
+  return queryOptions({
+    queryKey: issueKeys.projectGantt(wsId, projectId),
+    queryFn: () => fetchProjectGanttIssues(projectId),
+  });
+}
+
+export function myIssueAssigneeGroupsOptions(
+  wsId: string,
+  scope: string,
+  filter: AssigneeGroupedIssuesFilter,
+) {
+  return queryOptions<GroupedIssuesResponse>({
+    queryKey: issueKeys.myAssigneeGroups(wsId, scope, filter),
+    queryFn: () =>
+      api.listGroupedIssues({
+        group_by: "assignee",
+        limit: ISSUE_PAGE_SIZE,
+        offset: 0,
+        ...filter,
+      }),
   });
 }
 
@@ -126,6 +251,13 @@ export function childIssuesOptions(wsId: string, id: string) {
   });
 }
 
+/**
+ * Single-fetch timeline options. The endpoint returns the full ordered set of
+ * comments + activities for an issue (server caps at 2000 as a safety net).
+ * Cursor pagination was removed in #1929 — at observed data sizes (p99 ~30
+ * entries per issue) it added complexity without a UX win and broke reply
+ * threads at page boundaries.
+ */
 export function issueTimelineOptions(issueId: string) {
   return queryOptions({
     queryKey: issueKeys.timeline(issueId),
@@ -154,5 +286,16 @@ export function issueUsageOptions(issueId: string) {
   return queryOptions({
     queryKey: issueKeys.usage(issueId),
     queryFn: () => api.getIssueUsage(issueId),
+  });
+}
+
+// Backs the description editor's fresh-sign download flow: NodeViews resolve
+// an attachment id by matching the markdown URL against this list. The list
+// is workspace-private metadata and lives on the same cache lifetime as the
+// rest of the issue detail surface.
+export function issueAttachmentsOptions(issueId: string) {
+  return queryOptions({
+    queryKey: issueKeys.attachments(issueId),
+    queryFn: () => api.listAttachments(issueId),
   });
 }

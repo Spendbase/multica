@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +13,13 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // slowProbeLocalSkillListStore wraps a LocalSkillListStore but blocks inside
@@ -182,6 +190,63 @@ func TestDaemonHeartbeat_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	}
 }
 
+// TestHandleDaemonWSHeartbeat_RuntimeGoneReturnsAckNotError pins the fix for
+// issue #2391: when GetAgentRuntime returns pgx.ErrNoRows (runtime row was
+// deleted server-side), the WS handler must return a successful ack with
+// RuntimeGone=true rather than an error. Returning an error makes the WS hub
+// log every beat at Warn — the flood the issue is about.
+func TestHandleDaemonWSHeartbeat_RuntimeGoneReturnsAckNotError(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	// A well-formed UUID that does NOT exist in agent_runtime. The handler
+	// must turn the resulting pgx.ErrNoRows into a RuntimeGone ack.
+	missingRuntime := uuid.New().String()
+	ack, err := testHandler.HandleDaemonWSHeartbeat(context.Background(),
+		daemonws.ClientIdentity{WorkspaceID: testWorkspaceID},
+		missingRuntime, false)
+	if err != nil {
+		t.Fatalf("HandleDaemonWSHeartbeat: unexpected error %v", err)
+	}
+	if ack == nil {
+		t.Fatal("HandleDaemonWSHeartbeat: nil ack for missing runtime")
+	}
+	if !ack.RuntimeGone {
+		t.Fatalf("ack.RuntimeGone = false, want true")
+	}
+	if ack.Status != protocol.HeartbeatStatusRuntimeGone {
+		t.Fatalf("ack.Status = %q, want %q", ack.Status, protocol.HeartbeatStatusRuntimeGone)
+	}
+	if ack.RuntimeID != missingRuntime {
+		t.Fatalf("ack.RuntimeID = %q, want %q", ack.RuntimeID, missingRuntime)
+	}
+}
+
+// TestDaemonHeartbeat_HTTPRuntimeGoneReturns404 pins the HTTP-path mirror:
+// pgx.ErrNoRows on the runtime lookup is the only DB error mapped to 404.
+// Anything else (transient pool issue, schema mismatch, ...) must surface
+// as 500 so the daemon does not mistake a hiccup for a deletion.
+func TestDaemonHeartbeat_HTTPRuntimeGoneReturns404(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	missingRuntime := uuid.New().String()
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
+		"runtime_id": missingRuntime,
+	}, testWorkspaceID, "test-daemon")
+	testHandler.DaemonHeartbeat(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing runtime, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(w.Body.String()), "runtime not found") {
+		t.Fatalf("expected 'runtime not found' body, got %s", w.Body.String())
+	}
+}
+
 // TestDaemonHeartbeat_SlowProbeDoesNotWedge pins the invariant that a stalled
 // HasPending probe cannot wedge the heartbeat endpoint past the per-probe
 // timeout. The probe is the only bounded call; PopPending is ack-safe-
@@ -323,6 +388,50 @@ func TestGetTaskStatus_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	}
 }
 
+// TestGetTaskStatus_TransientDBError_Returns500 verifies that a transient DB
+// error from GetAgentTask is reported as 500 rather than 404. The daemon
+// uses 404+"task not found" as a hard cancel signal; a transient lookup
+// failure must therefore not be smuggled into that body, otherwise a single
+// DB hiccup would kill an in-flight agent.
+func TestGetTaskStatus_TransientDBError_Returns500(t *testing.T) {
+	h := &Handler{}
+	h.Queries = db.New(&mockDB{getUserErr: errors.New("connection reset by peer")})
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("GET", "/api/daemon/tasks/00000000-0000-0000-0000-000000000001/status", nil,
+		"00000000-0000-0000-0000-000000000000", "test-daemon")
+	req = withURLParam(req, "taskId", "00000000-0000-0000-0000-000000000001")
+
+	h.GetTaskStatus(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("transient DB error: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "task not found") {
+		t.Fatalf("transient DB error must not surface as %q (daemon treats that as a deletion): %s", "task not found", w.Body.String())
+	}
+}
+
+// TestGetTaskStatus_ErrNoRows_Returns404 verifies that an actually-missing
+// task row still returns the 404+"task not found" body the daemon relies on
+// to interrupt the running agent.
+func TestGetTaskStatus_ErrNoRows_Returns404(t *testing.T) {
+	h := &Handler{}
+	h.Queries = db.New(&mockDB{getUserErr: pgx.ErrNoRows})
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("GET", "/api/daemon/tasks/00000000-0000-0000-0000-000000000001/status", nil,
+		"00000000-0000-0000-0000-000000000000", "test-daemon")
+	req = withURLParam(req, "taskId", "00000000-0000-0000-0000-000000000001")
+
+	h.GetTaskStatus(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("ErrNoRows: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "task not found") {
+		t.Fatalf("ErrNoRows: expected body to contain %q, got %s", "task not found", w.Body.String())
+	}
+}
+
 func TestGetIssueGCCheck_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
@@ -393,6 +502,21 @@ func withURLParams(req *http.Request, kv ...string) *http.Request {
 		rctx.URLParams.Add(kv[i], kv[i+1])
 	}
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+func TestListTaskMessagesByUser_InvalidTaskIDReturnsBadRequest(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks/optimistic-optimistic-1778739487737/messages", nil)
+	req = withURLParams(req, "taskId", "optimistic-optimistic-1778739487737")
+
+	(&Handler{}).ListTaskMessagesByUser(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid task id, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "task_id") {
+		t.Fatalf("expected task_id validation error, got %s", w.Body.String())
+	}
 }
 
 // setupForeignWorkspaceFixture creates an isolated workspace (not reachable
@@ -1797,6 +1921,140 @@ func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t
 	}
 }
 
+func TestCompleteTask_CommentTriggered_SuppressesTrivialDoneOutput(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'trivial-done-suppression fixture', 'in_progress', 'none', $2, 'member', 81200, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var triggerCommentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+		VALUES ($1, $2, 'member', $3, 'please follow up', 'comment')
+		RETURNING id
+	`, issueID, testWorkspaceID, testUserID).Scan(&triggerCommentID); err != nil {
+		t.Fatalf("setup: create trigger comment: %v", err)
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, trigger_comment_id,
+			status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		RETURNING id
+	`, agentID, runtimeID, issueID, triggerCommentID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create comment-triggered task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
+		map[string]any{"output": "Done."},
+		testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskId", taskID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.CompleteTask(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM comment
+		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
+	`, issueID, agentID).Scan(&count); err != nil {
+		t.Fatalf("count agent comments: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no synthesized agent comment for trivial Done output, got %d", count)
+	}
+}
+
+func TestCompleteTask_AssignmentTriggered_DoesNotSuppressTrivialDoneOutput(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'assignment-trivial-done fixture', 'in_progress', 'none', $2, 'member', 81201, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id,
+			status, priority, started_at
+		)
+		VALUES ($1, $2, $3, 'running', 0, now())
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create assignment-triggered task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
+		map[string]any{"output": "Done."},
+		testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskId", taskID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.CompleteTask(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var content string
+	if err := testPool.QueryRow(ctx, `
+		SELECT content FROM comment
+		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
+		ORDER BY created_at DESC LIMIT 1
+	`, issueID, agentID).Scan(&content); err != nil {
+		t.Fatalf("query synthesized comment: %v", err)
+	}
+	if content != "Done." {
+		t.Fatalf("synthesized comment content = %q, want Done.", content)
+	}
+}
+
 type claimRuntimeGuardTask struct {
 	PriorSessionID string `json:"prior_session_id"`
 	PriorWorkDir   string `json:"prior_work_dir"`
@@ -2092,6 +2350,96 @@ func TestClaimTask_IssuePriorSessionRuntimeGuard(t *testing.T) {
 	if task.PriorWorkDir != "/tmp/same-runtime-workdir" {
 		t.Fatalf("runtime match: expected PriorWorkDir='/tmp/same-runtime-workdir', got %q", task.PriorWorkDir)
 	}
+
+	var commentIssueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'comment-triggered-session-skip fixture', 'in_progress', 'none', $2, 'member', 81205, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&commentIssueID); err != nil {
+		t.Fatalf("setup: create comment-triggered issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, commentIssueID) })
+
+	var triggerCommentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+		VALUES ($1, $2, 'member', $3, 'please follow up', 'comment')
+		RETURNING id
+	`, commentIssueID, testWorkspaceID, testUserID).Scan(&triggerCommentID); err != nil {
+		t.Fatalf("setup: create trigger comment: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id,
+			status, priority, started_at, completed_at,
+			session_id, work_dir
+		)
+		VALUES ($1, $2, $3, 'completed', 0, now(), now(), 'comment-prior-session', '/tmp/comment-prior-workdir')
+	`, agentID, runtimeID, commentIssueID); err != nil {
+		t.Fatalf("setup: create comment-trigger prior task: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, trigger_comment_id,
+			status, priority
+		)
+		VALUES ($1, $2, $3, $4, 'queued', 0)
+	`, agentID, runtimeID, commentIssueID, triggerCommentID); err != nil {
+		t.Fatalf("setup: create comment-triggered task: %v", err)
+	}
+
+	task = claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+	if task.PriorSessionID != "" {
+		t.Fatalf("comment trigger: expected empty PriorSessionID, got %q", task.PriorSessionID)
+	}
+	if task.PriorWorkDir != "/tmp/comment-prior-workdir" {
+		t.Fatalf("comment trigger: expected PriorWorkDir='/tmp/comment-prior-workdir', got %q", task.PriorWorkDir)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now()
+		WHERE issue_id = $1 AND status IN ('dispatched', 'running')
+	`, commentIssueID); err != nil {
+		t.Fatalf("setup: complete claimed comment-trigger task: %v", err)
+	}
+
+	var freshIssueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'force-fresh-session fixture', 'in_progress', 'none', $2, 'member', 81206, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&freshIssueID); err != nil {
+		t.Fatalf("setup: create force-fresh issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, freshIssueID) })
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id,
+			status, priority, started_at, completed_at,
+			session_id, work_dir
+		)
+		VALUES ($1, $2, $3, 'completed', 0, now(), now(), 'force-fresh-prior-session', '/tmp/force-fresh-prior-workdir')
+	`, agentID, runtimeID, freshIssueID); err != nil {
+		t.Fatalf("setup: create force-fresh prior task: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id,
+			status, priority, force_fresh_session
+		)
+		VALUES ($1, $2, $3, 'queued', 0, TRUE)
+	`, agentID, runtimeID, freshIssueID); err != nil {
+		t.Fatalf("setup: create force-fresh task: %v", err)
+	}
+
+	task = claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+	if task.PriorSessionID != "" {
+		t.Fatalf("force fresh: expected empty PriorSessionID, got %q", task.PriorSessionID)
+	}
+	if task.PriorWorkDir != "" {
+		t.Fatalf("force fresh: expected empty PriorWorkDir, got %q", task.PriorWorkDir)
+	}
 }
 
 func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
@@ -2236,5 +2584,478 @@ func TestClaimTask_ChatLegacyNullRuntimeFallsBackToTaskRow(t *testing.T) {
 	}
 	if task.PriorWorkDir != "/tmp/legacy-fallback-workdir" {
 		t.Fatalf("legacy fallback: expected PriorWorkDir='/tmp/legacy-fallback-workdir', got %q", task.PriorWorkDir)
+	}
+}
+
+// TestGetChatSessionGCCheck verifies the chat session gc-check endpoint
+// matches the same anti-enumeration shape as GetIssueGCCheck: cross-workspace
+// daemon tokens get 404, same-workspace tokens get the live status.
+func TestGetChatSessionGCCheck(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var sessionID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO chat_session (workspace_id, agent_id, creator_id, title, status)
+		VALUES ($1, $2, $3, 'gc-check fixture', 'active')
+		RETURNING id
+	`, testWorkspaceID, agentID, testUserID).Scan(&sessionID); err != nil {
+		t.Fatalf("setup: create chat session: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM chat_session WHERE id = $1`, sessionID)
+
+	// Cross-workspace daemon token must 404 with no oracle.
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("GET", "/api/daemon/chat-sessions/"+sessionID+"/gc-check", nil,
+		"00000000-0000-0000-0000-000000000000", "attacker-daemon")
+	req = withURLParam(req, "sessionId", sessionID)
+	testHandler.GetChatSessionGCCheck(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace token: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Same-workspace daemon token sees the live row.
+	w = httptest.NewRecorder()
+	req = newDaemonTokenRequest("GET", "/api/daemon/chat-sessions/"+sessionID+"/gc-check", nil,
+		testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "sessionId", sessionID)
+	testHandler.GetChatSessionGCCheck(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("same-workspace token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Status    string `json:"status"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "active" {
+		t.Fatalf("expected status %q, got %q", "active", resp.Status)
+	}
+	if resp.UpdatedAt == "" {
+		t.Fatal("expected updated_at to be set")
+	}
+
+	// Hard-deleted session: 404 — exactly what the daemon needs to reclaim
+	// the workdir on the next GC pass after a user runs DeleteChatSession.
+	if _, err := testPool.Exec(ctx, `DELETE FROM chat_session WHERE id = $1`, sessionID); err != nil {
+		t.Fatalf("delete chat session: %v", err)
+	}
+	w = httptest.NewRecorder()
+	req = newDaemonTokenRequest("GET", "/api/daemon/chat-sessions/"+sessionID+"/gc-check", nil,
+		testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "sessionId", sessionID)
+	testHandler.GetChatSessionGCCheck(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("hard-deleted session: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetAutopilotRunGCCheck verifies the autopilot-run gc-check endpoint:
+// 200 with status+completed_at on success, 404 on cross-workspace probe.
+func TestGetAutopilotRunGCCheck(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var autopilotID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot (
+			workspace_id, title, assignee_id, execution_mode,
+			created_by_type, created_by_id
+		)
+		VALUES ($1, 'gc-check autopilot', $2, 'run_only', 'member', $3)
+		RETURNING id
+	`, testWorkspaceID, agentID, testUserID).Scan(&autopilotID); err != nil {
+		t.Fatalf("setup: create autopilot: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM autopilot WHERE id = $1`, autopilotID)
+
+	var runID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot_run (autopilot_id, source, status, completed_at)
+		VALUES ($1, 'manual', 'completed', NOW() - INTERVAL '6 days')
+		RETURNING id
+	`, autopilotID).Scan(&runID); err != nil {
+		t.Fatalf("setup: create autopilot_run: %v", err)
+	}
+
+	// Cross-workspace probe.
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("GET", "/api/daemon/autopilot-runs/"+runID+"/gc-check", nil,
+		"00000000-0000-0000-0000-000000000000", "attacker-daemon")
+	req = withURLParam(req, "runId", runID)
+	testHandler.GetAutopilotRunGCCheck(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace token: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Same-workspace probe.
+	w = httptest.NewRecorder()
+	req = newDaemonTokenRequest("GET", "/api/daemon/autopilot-runs/"+runID+"/gc-check", nil,
+		testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "runId", runID)
+	testHandler.GetAutopilotRunGCCheck(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("same-workspace token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Status      string `json:"status"`
+		CompletedAt string `json:"completed_at"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "completed" {
+		t.Fatalf("expected status %q, got %q", "completed", resp.Status)
+	}
+	if resp.CompletedAt == "" {
+		t.Fatal("expected completed_at to be set for terminal run")
+	}
+}
+
+// TestGetTaskGCCheck verifies the task gc-check endpoint that quick-create
+// workdirs key on. Same anti-enumeration shape via requireDaemonTaskAccess.
+func TestGetTaskGCCheck(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	// Quick-create-shaped task: no issue_id, no chat_session_id, no run id.
+	// context.type is set so ResolveTaskWorkspaceID can recover workspace.
+	quickContext, _ := json.Marshal(map[string]any{
+		"type":         "quick_create",
+		"prompt":       "fixture",
+		"requester_id": testUserID,
+		"workspace_id": testWorkspaceID,
+	})
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, status, priority, context, completed_at
+		)
+		VALUES ($1, $2, 'completed', 0, $3, NOW())
+		RETURNING id
+	`, agentID, runtimeID, quickContext).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create quick-create task: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+
+	// Cross-workspace probe.
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("GET", "/api/daemon/tasks/"+taskID+"/gc-check", nil,
+		"00000000-0000-0000-0000-000000000000", "attacker-daemon")
+	req = withURLParam(req, "taskId", taskID)
+	testHandler.GetTaskGCCheck(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace token: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Same-workspace probe — terminal task returns its status.
+	w = httptest.NewRecorder()
+	req = newDaemonTokenRequest("GET", "/api/daemon/tasks/"+taskID+"/gc-check", nil,
+		testWorkspaceID, "legit-daemon")
+	req = withURLParam(req, "taskId", taskID)
+	testHandler.GetTaskGCCheck(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("same-workspace token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Status      string `json:"status"`
+		CompletedAt string `json:"completed_at"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "completed" {
+		t.Fatalf("expected status %q, got %q", "completed", resp.Status)
+	}
+	if resp.CompletedAt == "" {
+		t.Fatal("expected completed_at to be set for completed task")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Membership Cache Integration Tests
+//
+// These tests don't just exercise the cache primitive (that's covered in
+// auth/membership_cache_test.go). They prove two things that the unit tests
+// can't:
+//
+//  1. requireDaemonWorkspaceAccess actually short-circuits the DB on a cache
+//     hit (the "ghost user" trick below).
+//  2. Each handler that mutates membership actually calls
+//     h.MembershipCache.Invalidate(...) — so a future refactor that drops
+//     one of those calls will fail CI instead of silently leaking a stale
+//     authorization grant for up to MembershipCacheTTL.
+// ---------------------------------------------------------------------------
+
+// installFreshMembershipCache swaps in a Redis-backed MembershipCache against
+// a freshly-flushed Redis DB for the test, restoring the original on cleanup.
+func installFreshMembershipCache(t *testing.T) {
+	t.Helper()
+	rdb := newRedisTestClient(t)
+	origCache := testHandler.MembershipCache
+	testHandler.MembershipCache = auth.NewMembershipCache(rdb)
+	t.Cleanup(func() { testHandler.MembershipCache = origCache })
+}
+
+// createEphemeralUser inserts a throwaway user with a unique email and
+// deletes it on test cleanup. Returns the user id as a string.
+func createEphemeralUser(t *testing.T, label string) string {
+	t.Helper()
+	email := fmt.Sprintf("membership-cache-%s-%s@multica.ai", label, uuid.NewString())
+	var userID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO "user" (name, email) VALUES ($1, $2) RETURNING id
+	`, "Membership Cache Test "+label, email).Scan(&userID); err != nil {
+		t.Fatalf("create ephemeral user: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id = $1`, userID)
+	})
+	return userID
+}
+
+// createEphemeralMember creates a throwaway user AND a member row in the
+// given workspace. Returns (userID, memberID). Both rows are cleaned up on
+// test exit.
+func createEphemeralMember(t *testing.T, workspaceID, label, role string) (string, string) {
+	t.Helper()
+	userID := createEphemeralUser(t, label)
+	var memberID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, $3) RETURNING id
+	`, workspaceID, userID, role).Scan(&memberID); err != nil {
+		t.Fatalf("create ephemeral member: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM member WHERE id = $1`, memberID)
+	})
+	return userID, memberID
+}
+
+// TestRequireDaemonWorkspaceAccess_CacheHit proves the cache lookup actually
+// short-circuits the DB query. The trick: the request actor is a "ghost"
+// user with NO member row in the workspace. With an empty cache the access
+// check must fail; after priming the cache it must succeed. If a future
+// change ever bypasses the cache and falls through to the DB, the priming
+// step stops mattering and the second assertion catches it.
+func TestRequireDaemonWorkspaceAccess_CacheHit(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+	ctx := context.Background()
+
+	ghostUserID := createEphemeralUser(t, "ghost")
+
+	// Baseline: with an empty cache the ghost has no path to access.
+	req := newRequestAsUser(ghostUserID, "GET", "/api/daemon/workspaces/"+testWorkspaceID+"/repos", nil)
+	w := httptest.NewRecorder()
+	if testHandler.requireDaemonWorkspaceAccess(w, req, testWorkspaceID) {
+		t.Fatal("setup: ghost user must not be allowed without cache priming")
+	}
+
+	// Priming the cache is the only thing that changes — the access check
+	// must now succeed via the cache short-circuit.
+	testHandler.MembershipCache.Set(ctx, ghostUserID, testWorkspaceID)
+
+	req = newRequestAsUser(ghostUserID, "GET", "/api/daemon/workspaces/"+testWorkspaceID+"/repos", nil)
+	w = httptest.NewRecorder()
+	if !testHandler.requireDaemonWorkspaceAccess(w, req, testWorkspaceID) {
+		t.Fatalf("expected access via cache hit, got denied (status %d)", w.Code)
+	}
+}
+
+func TestRequireDaemonWorkspaceAccess_CacheMissBackfills(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+
+	ctx := context.Background()
+
+	// Cache is empty — verify miss.
+	if testHandler.MembershipCache.Get(ctx, testUserID, testWorkspaceID) {
+		t.Fatal("expected cache miss before request")
+	}
+
+	// Make a request that triggers DB lookup.
+	req := newRequest("GET", "/api/daemon/workspaces/"+testWorkspaceID+"/repos", nil)
+	w := httptest.NewRecorder()
+	if !testHandler.requireDaemonWorkspaceAccess(w, req, testWorkspaceID) {
+		t.Fatalf("expected access granted via DB lookup, got denied (status %d)", w.Code)
+	}
+
+	// Cache should now be backfilled.
+	if !testHandler.MembershipCache.Get(ctx, testUserID, testWorkspaceID) {
+		t.Fatal("expected cache to be backfilled after DB hit")
+	}
+}
+
+// TestMembershipCache_InvalidatedOnDeleteMember drives a real DeleteMember
+// HTTP handler call and asserts the cache entry for the removed member is
+// gone afterwards. Guards against future refactors that move or drop the
+// h.MembershipCache.Invalidate(...) line in workspace.go.
+func TestMembershipCache_InvalidatedOnDeleteMember(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+	ctx := context.Background()
+
+	targetUserID, targetMemberID := createEphemeralMember(t, testWorkspaceID, "delete", "admin")
+	testHandler.MembershipCache.Set(ctx, targetUserID, testWorkspaceID)
+	if !testHandler.MembershipCache.Get(ctx, targetUserID, testWorkspaceID) {
+		t.Fatal("setup: expected cache hit after Set")
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("DELETE", "/api/workspaces/"+testWorkspaceID+"/members/"+targetMemberID, nil)
+	req = withURLParams(req, "id", testWorkspaceID, "memberId", targetMemberID)
+	testHandler.DeleteMember(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("DeleteMember: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if testHandler.MembershipCache.Get(ctx, targetUserID, testWorkspaceID) {
+		t.Fatal("DeleteMember handler did not invalidate membership cache for removed user")
+	}
+}
+
+// TestMembershipCache_InvalidatedOnUpdateMember drives a real UpdateMember
+// (role change) call and asserts the cache entry is invalidated. The cache
+// stores only the existence of membership, but UpdateMember still flushes
+// the entry so any downstream caller that did add role-aware caching later
+// would not silently see a stale role.
+func TestMembershipCache_InvalidatedOnUpdateMember(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+	ctx := context.Background()
+
+	targetUserID, targetMemberID := createEphemeralMember(t, testWorkspaceID, "update", "admin")
+	testHandler.MembershipCache.Set(ctx, targetUserID, testWorkspaceID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("PUT", "/api/workspaces/"+testWorkspaceID+"/members/"+targetMemberID,
+		map[string]any{"role": "member"})
+	req = withURLParams(req, "id", testWorkspaceID, "memberId", targetMemberID)
+	testHandler.UpdateMember(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateMember: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if testHandler.MembershipCache.Get(ctx, targetUserID, testWorkspaceID) {
+		t.Fatal("UpdateMember handler did not invalidate membership cache for updated user")
+	}
+}
+
+// TestMembershipCache_InvalidatedOnLeaveWorkspace exercises the self-removal
+// path (LeaveWorkspace, not DeleteMember). Both handlers route through
+// revokeAndRemoveMember, but the Invalidate call lives in the handler — a
+// refactor that consolidates them could drop one invalidation without the
+// other test catching it.
+func TestMembershipCache_InvalidatedOnLeaveWorkspace(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+	ctx := context.Background()
+
+	targetUserID, _ := createEphemeralMember(t, testWorkspaceID, "leave", "admin")
+	testHandler.MembershipCache.Set(ctx, targetUserID, testWorkspaceID)
+
+	w := httptest.NewRecorder()
+	req := newRequestAsUser(targetUserID, "DELETE", "/api/workspaces/"+testWorkspaceID+"/leave", nil)
+	req = withURLParam(req, "id", testWorkspaceID)
+	testHandler.LeaveWorkspace(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("LeaveWorkspace: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if testHandler.MembershipCache.Get(ctx, targetUserID, testWorkspaceID) {
+		t.Fatal("LeaveWorkspace handler did not invalidate membership cache for leaver")
+	}
+}
+
+// TestMembershipCache_InvalidatedOnDeleteWorkspace exercises the bulk
+// invalidation path: when the workspace is deleted, every member's cache
+// entry must be flushed. We create an isolated workspace with two members
+// (owner + extra) so the shared testWorkspace stays intact.
+func TestMembershipCache_InvalidatedOnDeleteWorkspace(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	installFreshMembershipCache(t)
+	ctx := context.Background()
+
+	const slug = "membership-cache-delete-ws"
+	_, _ = testPool.Exec(ctx, `DELETE FROM workspace WHERE slug = $1`, slug)
+	var wsID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4) RETURNING id
+	`, "Membership Cache Delete WS", slug, "DeleteWorkspace cache invalidation test", "MCD").Scan(&wsID); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, wsID)
+	})
+
+	// testUser must be an owner of the isolated workspace to call
+	// DeleteWorkspace.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role) VALUES ($1, $2, 'owner')
+	`, wsID, testUserID); err != nil {
+		t.Fatalf("add owner: %v", err)
+	}
+
+	extraUserID, _ := createEphemeralMember(t, wsID, "ws-delete-extra", "admin")
+
+	testHandler.MembershipCache.Set(ctx, testUserID, wsID)
+	testHandler.MembershipCache.Set(ctx, extraUserID, wsID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("DELETE", "/api/workspaces/"+wsID, nil)
+	req = withURLParam(req, "id", wsID)
+	testHandler.DeleteWorkspace(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("DeleteWorkspace: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if testHandler.MembershipCache.Get(ctx, testUserID, wsID) {
+		t.Fatal("DeleteWorkspace handler did not invalidate owner cache entry")
+	}
+	if testHandler.MembershipCache.Get(ctx, extraUserID, wsID) {
+		t.Fatal("DeleteWorkspace handler did not invalidate extra-member cache entry")
 	}
 }
