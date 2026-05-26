@@ -1,4 +1,4 @@
-export type { Issue, IssueStatus, IssuePriority, IssueAssigneeType, IssueReaction } from "./issue";
+export type { Issue, IssueStatus, IssuePriority, IssueAssigneeType, IssueMetadata, IssueMetadataValue, IssueReaction } from "./issue";
 export type {
   Agent,
   AgentStatus,
@@ -18,6 +18,8 @@ export type {
   CreateAgentFromTemplateResponse,
   CreateAgentFromTemplateFailure,
   UpdateAgentRequest,
+  AgentEnvResponse,
+  UpdateAgentEnvRequest,
   Skill,
   SkillSummary,
   AgentSkillSummary,
@@ -114,6 +116,7 @@ export type {
   Squad,
   SquadMember,
   SquadMemberType,
+  SquadMemberPreview,
   SquadActivityLog,
   SquadActivityOutcome,
   CreateSquadRequest,

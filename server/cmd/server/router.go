@@ -131,13 +131,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	cfSigner := auth.NewCloudFrontSignerFromEnv()
 
 	signupConfig := handler.Config{
-		AllowSignup:                   os.Getenv("ALLOW_SIGNUP") != "false",
-		AllowedEmails:                 splitAndTrim(os.Getenv("ALLOWED_EMAILS")),
-		AllowedEmailDomains:           splitAndTrim(os.Getenv("ALLOWED_EMAIL_DOMAINS")),
-		UseDailyRollupForRuntimeUsage: os.Getenv("USAGE_DAILY_ROLLUP_ENABLED") == "true",
-		UseDailyRollupForDashboard:    os.Getenv("USAGE_DASHBOARD_ROLLUP_ENABLED") == "true",
-		PublicURL:                     strings.TrimRight(strings.TrimSpace(os.Getenv("MULTICA_PUBLIC_URL")), "/"),
-		TrustedProxies:                parseTrustedProxies(os.Getenv("MULTICA_TRUSTED_PROXIES")),
+		AllowSignup:              os.Getenv("ALLOW_SIGNUP") != "false",
+		AllowedEmails:            splitAndTrim(os.Getenv("ALLOWED_EMAILS")),
+		AllowedEmailDomains:      splitAndTrim(os.Getenv("ALLOWED_EMAIL_DOMAINS")),
+		PublicURL:                strings.TrimRight(strings.TrimSpace(os.Getenv("MULTICA_PUBLIC_URL")), "/"),
+		TrustedProxies:           parseTrustedProxies(os.Getenv("MULTICA_TRUSTED_PROXIES")),
+		CloudRuntimeFleetURL:     cloudRuntimeFleetURLFromEnv(),
+		CloudRuntimeFleetTimeout: envDuration("MULTICA_CLOUD_FLEET_TIMEOUT", 35*time.Second),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
 	if opts.DaemonWakeup != nil {
@@ -225,7 +225,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   origins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Workspace-ID", "X-Workspace-Slug", "X-Request-ID", "X-Agent-ID", "X-Task-ID", "X-CSRF-Token", "X-Client-Platform", "X-Client-Version", "X-Client-OS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Workspace-ID", "X-Workspace-Slug", "X-Request-ID", "X-Agent-ID", "X-Task-ID", "X-CSRF-Token", "X-Client-Platform", "X-Client-Version", "X-Client-OS", "X-User-PAT"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -275,6 +275,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	trustedProxies := middleware.ParseTrustedProxies(os.Getenv("RATE_LIMIT_TRUSTED_PROXIES"))
 	authRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_AUTH", 5), time.Minute, trustedProxies)
 	authVerifyRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_AUTH_VERIFY", 20), time.Minute, trustedProxies)
+	contactSalesRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_CONTACT_SALES", 5), time.Hour, trustedProxies)
 	r.With(authRL).Post("/auth/send-code", h.SendCode)
 	r.With(authVerifyRL).Post("/auth/verify-code", h.VerifyCode)
 	r.With(authRL).Post("/auth/google", h.GoogleLogin)
@@ -282,6 +283,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 	// Public API
 	r.Get("/api/config", h.GetConfig)
+	r.With(contactSalesRL).Post("/api/contact-sales", h.CreateContactSales)
 
 	// Webhook ingress for autopilots. Outside the authenticated group on
 	// purpose: the bearer token in the URL path IS the credential. Workspace
@@ -337,9 +339,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Patch("/api/me", h.UpdateMe)
 		r.Patch("/api/me/onboarding", h.PatchOnboarding)
 		r.Post("/api/me/onboarding/complete", h.CompleteOnboarding)
+		r.Post("/api/me/onboarding/cloud-waitlist", h.JoinCloudWaitlist)
+		// DEPRECATED — shim routes for desktop < v3 during the rollout
+		// window. v3 frontend creates the Helper agent + starter issue
+		// via generic CreateAgent / CreateIssue and only calls /complete
+		// here. Remove once X-Client-Version telemetry confirms zero
+		// pre-v3 desktops are still calling these. Handlers live in
+		// server/internal/handler/onboarding_shim.go.
 		r.Post("/api/me/onboarding/runtime-bootstrap", h.BootstrapOnboardingRuntime)
 		r.Post("/api/me/onboarding/no-runtime-bootstrap", h.BootstrapOnboardingNoRuntime)
-		r.Post("/api/me/onboarding/cloud-waitlist", h.JoinCloudWaitlist)
 		r.Post("/api/cli-token", h.IssueCliToken)
 		r.Post("/api/upload-file", h.UploadFile)
 		r.Post("/api/feedback", h.CreateFeedback)
@@ -438,6 +446,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/labels", h.ListLabelsForIssue)
 					r.Post("/labels", h.AttachLabel)
 					r.Delete("/labels/{labelId}", h.DetachLabel)
+					r.Get("/metadata", h.ListIssueMetadata)
+					r.Put("/metadata/{key}", h.SetIssueMetadataKey)
+					r.Delete("/metadata/{key}", h.DeleteIssueMetadataKey)
 					r.Get("/pull-requests", h.ListPullRequestsForIssue)
 				})
 			})
@@ -555,6 +566,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/tasks", h.ListAgentTasks)
 					r.Get("/skills", h.ListAgentSkills)
 					r.Put("/skills", h.SetAgentSkills)
+					// Dedicated env-management endpoint. Owner/admin only;
+					// agent actors are denied. Every reveal / write is
+					// audited to activity_log. See MUL-2600 and
+					// internal/handler/agent_env.go.
+					r.Get("/env", h.GetAgentEnv)
+					r.Put("/env", h.UpdateAgentEnv)
 				})
 			})
 
@@ -579,12 +596,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/files", h.UpsertSkillFile)
 					r.Delete("/files/{fileId}", h.DeleteSkillFile)
 				})
-			})
-
-			// Usage
-			r.Route("/api/usage", func(r chi.Router) {
-				r.Get("/daily", h.GetWorkspaceUsageByDay)
-				r.Get("/summary", h.GetWorkspaceUsageSummary)
 			})
 
 			// Dashboard — workspace-wide token + run-time rollups for the
@@ -615,7 +626,30 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/local-skills/import", h.InitiateImportLocalSkill)
 					r.Get("/local-skills/import/{requestId}", h.GetLocalSkillImportRequest)
 					r.Delete("/", h.DeleteAgentRuntime)
+					// Cascade variant of DELETE: archive every active agent
+					// bound to this runtime, cancel their tasks, then delete
+					// the runtime — all in one transaction. Used by the
+					// DeleteRuntimeDialog when the strict DELETE refused with
+					// `runtime_has_active_agents` and the user confirmed the
+					// cascade plan.
+					r.Post("/archive-agents-and-delete", h.ArchiveAgentsAndDeleteRuntime)
 				})
+			})
+
+			// Cloud Runtime fleet proxy. The remote service URL is configured
+			// on SaaS API nodes only; self-hosted deployments return 503.
+			r.Route("/api/cloud-runtime", func(r chi.Router) {
+				r.Get("/", h.GetCloudRuntimeService)
+				r.Get("/healthz", h.GetCloudRuntimeHealth)
+				r.Get("/readyz", h.GetCloudRuntimeReady)
+				r.Get("/nodes", h.ListCloudRuntimeNodes)
+				r.Post("/nodes", h.CreateCloudRuntimeNode)
+				r.Delete("/nodes", h.DeleteCloudRuntimeNode)
+				r.Post("/nodes/start", h.StartCloudRuntimeNode)
+				r.Post("/nodes/stop", h.StopCloudRuntimeNode)
+				r.Post("/nodes/reboot", h.RebootCloudRuntimeNode)
+				r.Post("/nodes/status", h.GetCloudRuntimeNodeStatus)
+				r.Post("/nodes/exec", h.ExecCloudRuntimeNode)
 			})
 
 			// Tasks (user-facing, with ownership check)
@@ -752,4 +786,11 @@ func splitAndTrim(s string) []string {
 		}
 	}
 	return res
+}
+
+func cloudRuntimeFleetURLFromEnv() string {
+	if url := strings.TrimSpace(os.Getenv("MULTICA_CLOUD_FLEET_URL")); url != "" {
+		return url
+	}
+	return strings.TrimSpace(os.Getenv("MULTICA_FLEET_URL"))
 }
